@@ -1,8 +1,10 @@
 # NetMonitor
 
+[![CI](https://github.com/wangsawfer/NetMonitor/actions/workflows/ci.yml/badge.svg)](https://github.com/wangsawfer/NetMonitor/actions/workflows/ci.yml)
+
 **Windows 11 上针对指定应用程序及其子进程的事件驱动 DNS 监控工具。**
 
-给出一个可执行文件路径，NetMonitor 会**先建立监控、再启动该程序**，
+给出一个可执行文件路径（可多个），NetMonitor 会**先建立监控、再启动该程序**，
 从第一条 DNS 查询起实时显示它访问过的每个域名——时间戳、进程名、PID、域名，
 并明确忽略其它进程产生的查询。
 
