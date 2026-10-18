@@ -1011,7 +1011,7 @@ python -I .cache/test/guitest_hosts.py
 | `cargo check --all-targets` | 通过；测试构建保留两条原有的 dead-code 警告 |
 | 单进程 hosts 端到端（`e2e_hosts_subset.py`） | 16 项通过（旧协议 `process` 仍兼容） |
 | 多进程合并端到端（`e2e_multi.py`） | 15 项通过：两个目标各成根、一次写入产生两行且每行同时记录两个进程、单行删除只删一行、**多进程自动模式把删掉的行补回并合并归属** |
-| 图形界面烟雾测试（`smoke_multi_gui.py`） | 21 项通过：文件/名称目标同列表、右键移除/清空、hosts 进程右键选择与绿色标记、多进程写入/自动命令带 `processes[]` |
+| 图形界面烟雾测试（`smoke_multi_gui.py`） | 33 项通过：文件/名称目标同列表、右键移除/清空、hosts 进程右键选择与绿色标记、多进程写入/自动命令带 `processes[]`、当前条目多选去重、批量复制/删除、右键菜单存活与标签 |
 | 单文件 exe 构建 | `NetMonitor-1.1.0-portable.exe`（约 11 MB）；`--selftest` 确认内置引擎存在、`wpcap` 可加载；实际启动并抓到 testapp 的 DNS 记录（截图验证） |
 | 便携文件夹包 | `scripts/package.ps1` 仍可用，产物 `NetMonitor-1.1.0-win64.zip` |
 
@@ -1022,3 +1022,11 @@ python -I .cache/test/guitest_hosts.py
 - 自动模式在任一进程仍有未落定的 AAAA 查询时不写；全部落定且计划稳定 1.5 秒后
   合并写入一次、一次备份。
 - 关闭文件后重新读取（`hosts_read`）不会把用户主动“全不选”恢复成默认进程。
+
+### 1.1.0 修订（2026-10-18，未改版本号）
+
+| 修复 | 验证 |
+|---|---|
+| hosts 进程列表右键菜单无效 | 菜单改为复用同一个 `tk.Menu`，不再在 `tk_popup` 返回后立即 `destroy`；烟雾测试确认处理函数返回后菜单仍存在且有 4 个菜单项 |
+| 「当前条目」只能单选 | 改为 `selectmode="extended"`；共用行按 `(address, domain, line)` 去重；批量复制/删除各发一条命令，状态栏按批次倒计数报告；烟雾测试覆盖 3 行显示去重为 2 行、删除 2 条命令、批次完成提示 |
+| 界面留白偏多 | 主窗口与 hosts 窗口的 padding / pady 收紧，目标列表与进程列表拉伸到可用宽度；截图复核（`compact-main.png`、`compact-hosts.png`） |

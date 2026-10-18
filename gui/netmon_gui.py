@@ -335,7 +335,7 @@ class Engine:
 
 class App(ttk.Frame):
     def __init__(self, master: tk.Tk) -> None:
-        super().__init__(master, padding=8)
+        super().__init__(master, padding=6)
         self.master: tk.Tk = master
         self.grid(sticky="nsew")
         master.rowconfigure(0, weight=1)
@@ -375,6 +375,13 @@ class App(ttk.Frame):
         # rows are drawn green.
         self._hosts_chosen: list[str] = []
         self._hosts_proc_hint: Optional[ttk.Label] = None
+        # Reused by the process picker's right-click menu: posting a menu is
+        # asynchronous, so the menu must outlive the event handler.
+        self._hosts_proc_menu: Optional[tk.Menu] = None
+        # Multi-line delete: how many replies are still outstanding, and how
+        # many lines were asked for, so the status line can report the batch.
+        self._hosts_delete_batch = 0
+        self._hosts_delete_total = 0
         # Set once the user has chosen or cleared something, so a file reload
         # does not silently put the default process back.
         self._hosts_choice_made = False
@@ -436,7 +443,7 @@ class App(ttk.Frame):
 
     def _build_widgets(self) -> None:
         # 第 0 行：目标选择
-        target = ttk.LabelFrame(self, text=" 目标程序 ", padding=6)
+        target = ttk.LabelFrame(self, text=" 目标程序 ", padding=4)
         target.grid(row=0, column=0, sticky="ew")
         target.columnconfigure(1, weight=1)
 
@@ -455,9 +462,9 @@ class App(ttk.Frame):
         # 两种目标可以混在一起，右键管理这一份列表。
         self.targets: list[tuple[str, str]] = []
         box_frame = ttk.Frame(target)
-        box_frame.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+        box_frame.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(4, 0))
         box_frame.columnconfigure(0, weight=1)
-        self.targets_box = tk.Listbox(box_frame, height=4, exportselection=False,
+        self.targets_box = tk.Listbox(box_frame, height=3, exportselection=False,
                                       font=("Consolas", 10), activestyle="none",
                                       selectmode="extended")
         self.targets_box.grid(row=0, column=0, sticky="ew")
@@ -467,55 +474,55 @@ class App(ttk.Frame):
         self.targets_box.configure(yscrollcommand=sb_targets.set)
         ttk.Label(target, text="要监控的程序（可多个，\n右键可移除 / 清空）：",
                   foreground="#666666").grid(
-            row=1, column=0, sticky="nw", pady=(6, 0))
+            row=1, column=0, sticky="nw", pady=(4, 0))
         self.targets_box.bind("<Button-3>", self._on_targets_right_click)
         self.targets_box.bind("<Delete>", lambda _e: self.on_remove_target())
         self._targets_menu = tk.Menu(self.targets_box, tearoff=0)
         self._targets_menu.add_command(label="移除选中", command=self.on_remove_target)
         self._targets_menu.add_command(label="清空列表", command=self.on_clear_targets)
 
-        ttk.Label(target, text="启动参数：").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(target, text="启动参数：").grid(row=2, column=0, sticky="w", pady=(4, 0))
         self.var_args = tk.StringVar()
         ttk.Entry(target, textvariable=self.var_args).grid(
-            row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+            row=2, column=1, columnspan=3, sticky="ew", pady=(4, 0))
 
         # 浏览器这类"单实例"程序，在已经打开的情况下再启动一个新进程，它会立刻
         # 把请求转交给已有实例并退出——真正的浏览器进程不是它的子进程，于是什么
         # 都抓不到。按映像名监视才是可行的做法。
         # 名字会加入上面的同一个列表，和可执行文件一起作为本次监控的目标。
-        ttk.Label(target, text="按名称监视：").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(target, text="按名称监视：").grid(row=3, column=0, sticky="w", pady=(4, 0))
         self.var_attach = tk.StringVar()
         entry_attach = ttk.Entry(target, textvariable=self.var_attach)
-        entry_attach.grid(row=3, column=1, sticky="ew", pady=(6, 0))
+        entry_attach.grid(row=3, column=1, sticky="ew", pady=(4, 0))
         entry_attach.bind("<Return>", lambda _e: self.on_add_name())
         ttk.Button(target, text="添加名称", command=self.on_add_name,
-                   width=10).grid(row=3, column=2, padx=(0, 0), pady=(6, 0))
+                   width=10).grid(row=3, column=2, padx=(6, 0), pady=(4, 0))
         ttk.Label(target, text="进程映像名，如 msedge.exe（可填多个，加入上方列表）",
                   foreground="#666666").grid(row=3, column=3, sticky="w", padx=(6, 0),
-                                             pady=(6, 0))
+                                             pady=(4, 0))
 
         # 第 1 行：操作按钮
         bar = ttk.Frame(self)
-        bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        bar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         # 顺序即使用频率：先监控控制，再数据操作。全部支持快捷键（见 set_shortcuts）。
         self.btn_start = ttk.Button(bar, text="▶  开始监控 (F5)", command=self.on_start, width=18)
         self.btn_stop = ttk.Button(bar, text="■  停止 (F6)", command=self.on_stop, width=13)
         self.btn_pause = ttk.Button(bar, text="⏸  暂停滚动 (F7)", command=self.on_toggle_pause, width=17)
-        self.btn_start.pack(side="left", padx=2)
-        self.btn_stop.pack(side="left", padx=2)
-        self.btn_pause.pack(side="left", padx=(2, 14))
-        ttk.Button(bar, text="🗑  清空", command=self.on_clear, width=10).pack(side="left", padx=2)
-        ttk.Button(bar, text="💾  导出… (F8)", command=self.on_export, width=14).pack(side="left", padx=2)
-        ttk.Button(bar, text="📊  统计", command=self.on_stats, width=10).pack(side="left", padx=2)
-        ttk.Button(bar, text="📋  日志", command=self.on_logs, width=10).pack(side="left", padx=2)
+        self.btn_start.pack(side="left", padx=1)
+        self.btn_stop.pack(side="left", padx=1)
+        self.btn_pause.pack(side="left", padx=(1, 10))
+        ttk.Button(bar, text="🗑  清空", command=self.on_clear, width=10).pack(side="left", padx=1)
+        ttk.Button(bar, text="💾  导出… (F8)", command=self.on_export, width=14).pack(side="left", padx=1)
+        ttk.Button(bar, text="📊  统计", command=self.on_stats, width=10).pack(side="left", padx=1)
+        ttk.Button(bar, text="📋  日志", command=self.on_logs, width=10).pack(side="left", padx=1)
         ttk.Button(bar, text="🌐  域名表 (Ctrl+W)", command=self.on_domains,
-                   width=18).pack(side="left", padx=2)
+                   width=18).pack(side="left", padx=1)
         ttk.Button(bar, text="📝  写入 hosts (Ctrl+H)", command=self.on_hosts,
-                   width=20).pack(side="left", padx=2)
+                   width=20).pack(side="left", padx=1)
 
         # 第 2 行：过滤
-        flt = ttk.LabelFrame(self, text=" 过滤 ", padding=6)
-        flt.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        flt = ttk.LabelFrame(self, text=" 过滤 ", padding=4)
+        flt.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         flt.columnconfigure(1, weight=1)
         flt.columnconfigure(3, weight=1)
 
@@ -533,15 +540,15 @@ class App(ttk.Frame):
         ttk.Label(flt, text="IP / 网段(10.0.0.0/8) / 片段",
                   foreground="#888888").grid(row=0, column=4, sticky="w", padx=(6, 0))
 
-        ttk.Label(flt, text="进程名包含：").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(flt, text="进程名包含：").grid(row=1, column=0, sticky="w", pady=(3, 0))
         self.var_f_proc = tk.StringVar()
         self.var_f_proc.trace_add("write", lambda *_: self._schedule_filter())
         self.entry_proc = ttk.Entry(flt, textvariable=self.var_f_proc)
-        self.entry_proc.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+        self.entry_proc.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(3, 0))
 
         # 进程白名单：主进程和它的子进程全都在抓，这里只决定"看哪些"。
         procs = ttk.Frame(flt)
-        procs.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+        procs.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(3, 0))
         ttk.Label(procs, text="只看这些进程：").pack(side="left")
         self.lbl_procs = ttk.Label(procs, text="全部", foreground="#666666")
         self.lbl_procs.pack(side="left", padx=(0, 8))
@@ -551,20 +558,20 @@ class App(ttk.Frame):
                    width=6).pack(side="left", padx=(6, 0))
 
         src = ttk.Frame(flt)
-        src.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        src.grid(row=2, column=0, columnspan=5, sticky="w", pady=(3, 0))
         ttk.Label(src, text="数据源：").pack(side="left")
         for text, var in (("ETW（系统解析器）", self.show_etw),
                           ("PCAP（明文抓包）", self.show_pcap),
                           ("SNI（TLS 主机名）", self.show_sni),
                           ("无法归属", self.show_unattributed)):
             ttk.Checkbutton(src, text=text, variable=var,
-                            command=self._schedule_filter).pack(side="left", padx=(0, 10))
+                            command=self._schedule_filter).pack(side="left", padx=(0, 6))
         ttk.Button(src, text="清除过滤", command=self.on_clear_filter,
-                   width=10).pack(side="left", padx=(10, 0))
+                   width=10).pack(side="left", padx=(6, 0))
 
         # 第 3 行：表格
         table_frame = ttk.Frame(self)
-        table_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        table_frame.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
@@ -784,7 +791,18 @@ class App(ttk.Frame):
             self.send_command({"cmd": "hosts_read"})
         elif kind in ("hosts_written", "hosts_removed", "hosts_edited", "hosts_restored"):
             self._log(ev.get("note", kind))
-            self._set_hosts_status(ev.get("note", ""), ok=ev.get("ok", True))
+            batch_note: Optional[str] = None
+            if kind == "hosts_removed" and self._hosts_delete_batch > 0:
+                # One reply per line in a multi-line delete. Report the batch,
+                # not whichever single line happened to finish last.
+                self._hosts_delete_batch -= 1
+                if self._hosts_delete_batch == 0:
+                    batch_note = (
+                        f"已删除 {self._hosts_delete_total} 行（删除前已备份）")
+                else:
+                    batch_note = f"正在删除… 还剩 {self._hosts_delete_batch} 行"
+            else:
+                self._set_hosts_status(ev.get("note", ""), ok=ev.get("ok", True))
             # Anything that changed the file invalidates what we were showing:
             # reload the editor, and mark the preview so its "already written"
             # column catches up too.
@@ -795,9 +813,17 @@ class App(ttk.Frame):
             # same file.
             self.send_command({"cmd": "hosts_read"})
             self._refresh_hosts_preview()
+            if batch_note is not None:
+                # After the preview refresh, which sets its own status line.
+                self._set_hosts_status(batch_note, ok=True)
         elif kind == "hosts_result":
             self._log(ev.get("note", ""), "error" if not ev.get("ok") else "info")
-            self._set_hosts_status(ev.get("note", ""), ok=ev.get("ok", True))
+            if not ev.get("ok", True) and self._hosts_delete_batch > 0:
+                self._hosts_delete_batch = 0
+                self._set_hosts_status(
+                    f"批量删除中断：{ev.get('note', '')}", ok=False)
+            else:
+                self._set_hosts_status(ev.get("note", ""), ok=ev.get("ok", True))
         elif kind == "domain_tables":
             # Sent at startup (the previous session's tables) and again at the
             # end of a run, so a UI opened later still fills in.
@@ -1758,23 +1784,25 @@ class App(ttk.Frame):
         win.protocol("WM_DELETE_WINDOW", self.on_close_hosts)
 
         nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        nb.pack(fill="both", expand=True, padx=6, pady=6)
 
         # ---------------- tab 1: write ----------------
-        tab1 = ttk.Frame(nb, padding=8)
+        tab1 = ttk.Frame(nb, padding=6)
         nb.add(tab1, text=" 写入 ")
 
-        head = ttk.LabelFrame(tab1, text=" 要写入哪些进程的域名表（右键选择，可多选） ", padding=8)
+        head = ttk.LabelFrame(tab1, text=" 要写入哪些进程的域名表（右键选择，可多选） ", padding=6)
         head.pack(fill="x")
+        head.columnconfigure(1, weight=1)
         ttk.Label(head, text="进程：").grid(row=0, column=0, sticky="nw")
         proc_frame = ttk.Frame(head)
-        proc_frame.grid(row=0, column=1, sticky="w", padx=(0, 16))
+        proc_frame.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        proc_frame.columnconfigure(0, weight=1)
         self._hosts_proc_list = tk.Listbox(
-            proc_frame, height=5, width=40, exportselection=False,
+            proc_frame, height=4, width=30, exportselection=False,
             selectmode="browse", font=("Consolas", 10), activestyle="none",
             selectbackground="#e6f4ec", selectforeground="#0a6b3d",
         )
-        self._hosts_proc_list.grid(row=0, column=0, sticky="w")
+        self._hosts_proc_list.grid(row=0, column=0, sticky="ew")
         sb_proc = ttk.Scrollbar(proc_frame, orient="vertical",
                                 command=self._hosts_proc_list.yview)
         sb_proc.grid(row=0, column=1, sticky="ns")
@@ -1785,14 +1813,15 @@ class App(ttk.Frame):
         self._hosts_proc_list.bind("<Button-3>", self._on_hosts_proc_right_click)
         self._hosts_proc_list.bind("<Double-Button-1>",
                                    lambda _e: self._toggle_hosts_process_at_cursor())
+        self._hosts_proc_menu = tk.Menu(self._hosts_proc_list, tearoff=0)
         self._hosts_proc_hint = ttk.Label(head, text="", foreground="#666666")
-        self._hosts_proc_hint.grid(row=1, column=1, sticky="w", pady=(4, 0))
+        self._hosts_proc_hint.grid(row=1, column=1, sticky="w", pady=(2, 0))
         ttk.Button(head, text="刷新进程列表", command=self._fill_hosts_processes,
                    width=14).grid(row=0, column=2, sticky="n")
 
-        ttk.Label(head, text="无 IPv6 的域名：").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(head, text="无 IPv6 的域名：").grid(row=2, column=0, sticky="w", pady=(6, 0))
         pol = ttk.Frame(head)
-        pol.grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        pol.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Radiobutton(pol, text="指向 127.0.0.1（禁用该域名）",
                         variable=self._hosts_policy,
                         value="block", command=self._on_policy_change
@@ -1800,10 +1829,10 @@ class App(ttk.Frame):
         ttk.Radiobutton(pol, text="不写入（保持原解析）",
                         variable=self._hosts_policy,
                         value="skip", command=self._on_policy_change
-                        ).pack(side="left", padx=(14, 0))
+                        ).pack(side="left", padx=(10, 0))
 
-        auto = ttk.LabelFrame(tab1, text=" 自动模式（可多进程，同名域名合并为一行） ", padding=8)
-        auto.pack(fill="x", pady=(8, 0))
+        auto = ttk.LabelFrame(tab1, text=" 自动模式（可多进程，同名域名合并为一行） ", padding=6)
+        auto.pack(fill="x", pady=(6, 0))
         ttk.Checkbutton(
             auto,
             text="开启后，上方已选进程的域名表一有变化就自动写入 hosts",
@@ -1817,7 +1846,7 @@ class App(ttk.Frame):
             foreground="#666666", wraplength=900,
         ).pack(anchor="w", pady=(2, 0))
 
-        actions = ttk.Frame(tab1, padding=(0, 8))
+        actions = ttk.Frame(tab1, padding=(0, 6))
         actions.pack(fill="x")
         ttk.Button(actions, text="写入 hosts", command=self.on_hosts_write,
                    width=12).pack(side="left")
@@ -1881,7 +1910,7 @@ class App(ttk.Frame):
         self._hosts_tree = tree
 
         # ---------------- tab 2: current entries, grouped by process ----------
-        tab_entries = ttk.Frame(nb, padding=8)
+        tab_entries = ttk.Frame(nb, padding=6)
         nb.add(tab_entries, text=" 当前条目 ")
         bar3 = ttk.Frame(tab_entries)
         bar3.pack(fill="x")
@@ -1891,14 +1920,14 @@ class App(ttk.Frame):
         self._hosts_entries_info.pack(side="left", padx=12)
         ttk.Label(
             bar3,
-            text="本程序管理的区块；一行被两个进程共用时，在两边各出现一次",
+            text="本程序管理的区块；Ctrl/Shift 多选，右键复制或删除；共用行在两个进程下各出现一次",
             foreground="#666666",
         ).pack(side="right")
         # The tree column carries the process; the two data columns are the
         # entry itself. Parent rows are processes, children are their lines.
         entries = ttk.Treeview(
             tab_entries, columns=("address", "domain"),
-            show="tree headings", selectmode="browse",
+            show="tree headings", selectmode="extended",
         )
         entries.heading("#0", text="进程")
         entries.heading("address", text="地址")
@@ -1908,8 +1937,8 @@ class App(ttk.Frame):
         entries.column("domain", width=320, anchor="w")
         sb3 = ttk.Scrollbar(tab_entries, orient="vertical", command=entries.yview)
         entries.configure(yscrollcommand=sb3.set)
-        entries.pack(side="left", fill="both", expand=True, pady=(8, 0))
-        sb3.pack(side="right", fill="y", pady=(8, 0))
+        entries.pack(side="left", fill="both", expand=True, pady=(6, 0))
+        sb3.pack(side="right", fill="y", pady=(6, 0))
         entries.tag_configure("process", foreground="#1f3b57")
         entries.tag_configure("ipv6", foreground="#0a7d3d")
         entries.tag_configure("block", foreground="#a11")
@@ -1925,7 +1954,7 @@ class App(ttk.Frame):
                 lambda _e: self._reload_hosts_if_visible())
 
         # ---------------- tab 3: view / edit ----------------
-        tab2 = ttk.Frame(nb, padding=8)
+        tab2 = ttk.Frame(nb, padding=6)
         nb.add(tab2, text=" 查看 / 编辑 ")
         bar2 = ttk.Frame(tab2)
         bar2.pack(fill="x")
@@ -1938,8 +1967,8 @@ class App(ttk.Frame):
         edit = tk.Text(tab2, wrap="none", font=("Consolas", 10), undo=True)
         sb2 = ttk.Scrollbar(tab2, orient="vertical", command=edit.yview)
         edit.configure(yscrollcommand=sb2.set)
-        edit.pack(side="left", fill="both", expand=True, pady=(8, 0))
-        sb2.pack(side="right", fill="y", pady=(8, 0))
+        edit.pack(side="left", fill="both", expand=True, pady=(6, 0))
+        sb2.pack(side="right", fill="y", pady=(6, 0))
         self._hosts_edit = edit
 
         self._fill_hosts_processes()
@@ -1958,10 +1987,13 @@ class App(ttk.Frame):
         self._hosts_info = None
         self._hosts_proc_list = None
         self._hosts_proc_hint = None
+        self._hosts_proc_menu = None
         self._hosts_entries_tree = None
         self._hosts_entries_info = None
         self._hosts_menu = None
         self._hosts_entries_menu = None
+        self._hosts_delete_batch = 0
+        self._hosts_delete_total = 0
         self._hosts_entries_by_iid.clear()
         self._hosts_row_keys.clear()
         self._hosts_preview_by_process.clear()
@@ -2061,7 +2093,8 @@ class App(ttk.Frame):
 
     def _on_hosts_proc_right_click(self, event: "tk.Event") -> None:
         lb = getattr(self, "_hosts_proc_list", None)
-        if lb is None or not lb.winfo_exists():
+        menu = getattr(self, "_hosts_proc_menu", None)
+        if lb is None or menu is None or not lb.winfo_exists():
             return
         index = lb.nearest(event.y)
         if index < 0 or index >= len(self._hosts_procs):
@@ -2070,7 +2103,11 @@ class App(ttk.Frame):
         lb.selection_set(index)
         lb.activate(index)
         name = self._hosts_procs[index]
-        menu = tk.Menu(lb, tearoff=0)
+        # The menu is created once and rebuilt here. `tk_popup` returns as soon
+        # as it is posted, so a menu destroyed in a `finally` block would be
+        # gone before the user could click it -- which is exactly why this
+        # looked like a dead right-click.
+        menu.delete(0, "end")
         chosen = name in self._hosts_chosen
         menu.add_command(
             label=("取消选择该进程" if chosen else "选择该进程"),
@@ -2083,7 +2120,6 @@ class App(ttk.Frame):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
-            menu.destroy()
 
     def _select_all_hosts_processes(self) -> None:
         self._hosts_choice_made = True
@@ -2260,17 +2296,38 @@ class App(ttk.Frame):
                 f"   文件总条目 {m.get('total_entries', 0)}"
                 f"   {m.get('path', '')}"))
 
-    def _selected_hosts_entry(self) -> Optional[dict]:
+    def _selected_hosts_entries(self) -> list[dict]:
+        """All selected lines, deduplicated.
+
+        A shared line is shown once under each owner; selecting both copies
+        must not delete it twice. The identity is the line itself.
+        """
         tree = getattr(self, "_hosts_entries_tree", None)
         if tree is None or not tree.winfo_exists():
-            return None
-        selection = tree.selection()
-        if not selection:
-            return None
-        return self._hosts_entries_by_iid.get(selection[0])
+            return []
+        out: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for iid in tree.selection():
+            entry = self._hosts_entries_by_iid.get(iid)
+            if entry is None:
+                continue
+            key = (
+                entry.get("address", ""),
+                entry.get("domain", ""),
+                entry.get("line", ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(entry)
+        return out
 
     def _on_hosts_entries_right_click(self, event: "tk.Event") -> None:
-        """Right-click a line for copy / delete; process headings have neither."""
+        """Right-click a line for copy / delete; process headings have neither.
+
+        Clicking inside an existing multi-selection keeps it, so the menu acts
+        on every selected line; clicking another line selects just that one.
+        """
         tree = getattr(self, "_hosts_entries_tree", None)
         menu = getattr(self, "_hosts_entries_menu", None)
         if tree is None or menu is None:
@@ -2279,53 +2336,76 @@ class App(ttk.Frame):
         if not row or not tree.parent(row):
             # A process heading is a grouping, not a line in the file.
             return
-        tree.selection_set(row)
+        if row not in tree.selection():
+            tree.selection_set(row)
         tree.focus(row)
+        count = len(self._selected_hosts_entries())
+        if count:
+            menu.entryconfigure(
+                0, label=f"复制所选行（{count} 行）" if count > 1 else "复制该行")
+            menu.entryconfigure(
+                1, label=f"删除所选 {count} 行…" if count > 1 else "删除该行…")
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
     def on_hosts_entry_copy(self) -> None:
-        entry = self._selected_hosts_entry()
-        if entry is None:
-            self._set_hosts_status("先选中一行", ok=False)
+        entries = self._selected_hosts_entries()
+        if not entries:
+            self._set_hosts_status("先选中至少一行", ok=False)
             return
-        line = entry.get("line") or "{} {}".format(
-            entry.get("address", ""), entry.get("domain", ""))
+        lines = [
+            e.get("line") or "{} {}".format(e.get("address", ""), e.get("domain", ""))
+            for e in entries
+        ]
         self.master.clipboard_clear()
-        self.master.clipboard_append(line)
-        self._set_hosts_status("已复制该行", ok=True)
+        self.master.clipboard_append("\n".join(lines))
+        self._set_hosts_status(
+            f"已复制 {len(lines)} 行" if len(lines) > 1 else "已复制该行", ok=True)
 
     def on_hosts_entry_delete(self) -> None:
-        """Delete one line outright, even if another process also owns it."""
-        entry = self._selected_hosts_entry()
-        if entry is None:
-            self._set_hosts_status("先选中一行", ok=False)
+        """Delete the selected lines outright, even if another process owns them."""
+        entries = self._selected_hosts_entries()
+        if not entries:
+            self._set_hosts_status("先选中至少一行", ok=False)
             return
-        domain = entry.get("domain", "")
-        address = entry.get("address", "")
-        owners = [o for o in (entry.get("owners") or []) if o]
+        shared: list[str] = []
+        for entry in entries:
+            owners = [o for o in (entry.get("owners") or []) if o]
+            if len(owners) > 1:
+                shared.append(
+                    f"{entry.get('domain', '')}（{'、'.join(owners)}）")
+        listing = "\n".join(
+            "{}    {}".format(e.get("address", ""), e.get("domain", ""))
+            for e in entries[:10])
+        if len(entries) > 10:
+            listing += f"\n… 共 {len(entries)} 行"
         shared_note = ""
-        if len(owners) > 1:
+        if shared:
             shared_note = (
-                "\n\n注意：这一行同时属于 " + "、".join(owners) +
-                "，删除后所有进程都不再拥有它。")
+                "\n\n注意：以下行同时属于多个进程，删除后所有进程都不再拥有它：\n"
+                + "\n".join(shared[:6])
+                + ("\n…" if len(shared) > 6 else ""))
         if not messagebox.askyesno(
             APP_TITLE,
-            f"从 hosts 文件里删除这一行？\n\n"
-            f"{address}    {domain}\n"
-            f"归属：{'、'.join(owners) if owners else '(未记录进程)'}"
+            f"从 hosts 文件里删除选中的 {len(entries)} 行？\n\n"
+            f"{listing}"
             f"{shared_note}\n\n"
-            "只删除这一行，文件其它内容不动；删除前会自动备份。",
+            "只删除这些行，文件其它内容不动；每一行删除前都会自动备份。",
         ):
             return
-        self.send_command({
-            "cmd": "hosts_remove_entry",
-            "domain": domain,
-            "address": address,
-            "process": owners[0] if owners else "",
-        })
+        self._hosts_delete_batch = len(entries)
+        self._hosts_delete_total = len(entries)
+        self._set_hosts_status(f"正在删除 {len(entries)} 行…", ok=True)
+        for entry in entries:
+            owners = [o for o in (entry.get("owners") or []) if o]
+            self.send_command({
+                "cmd": "hosts_remove_entry",
+                "domain": entry.get("domain", ""),
+                "address": entry.get("address", ""),
+                "process": owners[0] if owners else "",
+            })
 
     def _reload_hosts(self) -> None:
         self.send_command({"cmd": "hosts_read"})
