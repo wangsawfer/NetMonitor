@@ -44,6 +44,12 @@ drops: none   DNS 137  domains 42  rate 8.6/s  cpu 0.4%  …            ▁▃�
   只动自己标记的区块，改前自动备份，可查看/编辑/恢复；域名表与改动记录**跨重启保留**，
   之前写的条目重启后仍可查、可按进程移除
 
+## 下载
+
+- **发布包**：[Releases](https://github.com/wangsawfer/NetMonitor/releases)
+  （`NetMonitor-1.0.0-win64.zip`，解压即用；含 exe、图形界面、文档与源码）
+- 单独的可执行文件：同一 Release 里的 `netmon.exe`（无界面 / `--stream-json` 引擎）
+
 ## 快速开始
 
 ```cmd
