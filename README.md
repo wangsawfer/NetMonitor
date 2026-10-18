@@ -287,4 +287,4 @@ ipv6/
 
 开发中依赖 [Npcap](https://npcap.com/)（Nmap Project 的 Windows 抓包库与驱动）；
 Npcap 的安装程序随发布包分发，其许可条款见安装器内 LICENSE，与本项目的 MIT
-许可相互独立。
+许可相互独立。Rust crate 依赖列在 `netmon/Cargo.lock` 中，各自遵循其作者声明的许可。

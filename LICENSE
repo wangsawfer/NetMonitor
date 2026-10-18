@@ -19,13 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Third-party components are distributed under their own licenses:
-
-* Npcap (https://npcap.com/) -- Windows packet capture library and driver by
-  the Nmap Project. The installer bundled under dist/.../deps is covered by the
-  license shown in that installer; it is not part of this project's MIT grant.
-* Rust crate dependencies are listed in netmon/Cargo.lock and carry the
-  licenses declared by their authors.
