@@ -1,0 +1,58 @@
+[package]
+name = "netmon"
+version = "1.0.0"
+edition = "2024"
+description = "Event-driven Windows network (DNS) monitor for a target application tree"
+authors = ["NetMonitor"]
+
+[[bin]]
+name = "netmon"
+path = "src/main.rs"
+
+[[bin]]
+name = "etwprobe"
+path = "src/bin/etwprobe.rs"
+
+# Deterministic verification target: resolves names, forks a child, and can
+# emit a TLS ClientHello. Used by scripts/verify.ps1 and the test report.
+[[bin]]
+name = "testapp"
+path = "src/bin/testapp.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
+csv = "1.4.0"
+pcap = "2.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_NetworkManagement_Dns",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# NOTE: deliberately *not* `panic = "abort"`. The ETW event callback is an
+# `extern "system"` function; unwinding out of it would be undefined behaviour,
+# so we trap panics with `catch_unwind` inside the callback instead. That only
+# works when unwinding is enabled.
+strip = true

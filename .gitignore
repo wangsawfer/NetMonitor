@@ -1,0 +1,19 @@
+# Build toolchain and caches: machine-local, large, and never part of a source tree.
+.toolchain/
+.cache/
+
+# Runtime data written beside the executable: per-machine history, not source.
+netmon-data/
+hosts-backups/
+
+# Packaging residue: the staged folder is rebuilt by scripts/package.ps1.
+dist/NetMonitor-*-win64/
+
+# Python bytecode from running the GUI.
+__pycache__/
+*.pyc
+
+# Editor and OS noise.
+.vs/
+*.user
+Thumbs.db

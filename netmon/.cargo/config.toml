@@ -1,0 +1,25 @@
+# Build configuration for NetMonitor.
+#
+# LIBPCAP_VER tells the `pcap` crate's build script which libpcap feature level
+# to compile against. The Npcap runtime (wpcap.dll) is API-compatible with
+# libpcap 1.9.1, and reporting that version is what unlocks the modern setters
+# (`immediate_mode`, `buffer_size`, `precision`, ...) that we rely on.
+#
+# The actual import-library search path (wpcap.lib) is resolved by our own
+# build.rs, which accepts the NETMON_NPCAP_SDK environment variable.
+[env]
+LIBPCAP_VER = "1.9.1"
+
+# Link the MSVC C runtime statically.
+#
+# By default a windows-msvc binary imports VCRUNTIME140.dll, which only exists
+# when the "Visual C++ Redistributable for Visual Studio 2015-2022" is
+# installed. The task requires a build that runs on a clean Windows 11, so the
+# CRT is linked in. The UCRT (api-ms-win-crt-*) is part of Windows itself and
+# needs no action.
+#
+# This is a `[target.*]` key rather than RUSTFLAGS so that build scripts and
+# proc-macros -- which run on this machine and already have a perfectly good
+# runtime -- are not rebuilt for no reason.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,70 @@
+name: CI
+
+# The program only runs on Windows (ETW, Npcap, Win32 endpoints), so this is a
+# Windows-only pipeline. What it covers is the part that needs no Administrator:
+# the crate compiles, links against the Npcap import library, and every unit test
+# that does not require a trace session or the capture driver passes.
+#
+# The tests that do need elevation skip themselves when they cannot get it, so
+# the job is meaningful on a hosted runner.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Builds land here rather than in the repository, matching local layout.
+  CARGO_TARGET_DIR: ${{ github.workspace }}\.cache\target
+  NETMON_NPCAP_SDK: ${{ github.workspace }}\.cache\deps\npcap-sdk
+  # The Npcap SDK is a link-time dependency only. Pinning the version keeps the
+  # cached download and the headers in step with what the project is built with.
+  NPCAP_SDK_VERSION: "1.15"
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .cache/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('netmon/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Fetch the Npcap SDK (link-time only)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = $env:NETMON_NPCAP_SDK
+          $lib = Join-Path $dest 'Lib\x64\wpcap.lib'
+          if (Test-Path $lib) {
+            Write-Host "Npcap SDK already present at $dest"
+            exit 0
+          }
+          $zip = Join-Path $env:RUNNER_TEMP "npcap-sdk-$env:NPCAP_SDK_VERSION.zip"
+          $url = "https://npcap.com/dist/npcap-sdk-$env:NPCAP_SDK_VERSION.zip"
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          # The archive's root is Include/ + Lib/, which is exactly the layout
+          # build.rs expects (see scripts/install.ps1).
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          if (-not (Test-Path $lib)) { throw "wpcap.lib not found at $lib after extracting $zip" }
+
+      - name: cargo test
+        run: cargo test --manifest-path netmon/Cargo.toml --bins --no-fail-fast
+
+      - name: cargo build (release)
+        run: cargo build --manifest-path netmon/Cargo.toml --bins --release
