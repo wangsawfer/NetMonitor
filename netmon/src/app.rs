@@ -22,6 +22,7 @@ use crossbeam_channel::{Sender, bounded};
 
 use crate::capture::etw_dns::EtwDnsSource;
 use crate::capture::pcap_capture::PcapSource;
+use crate::hosts::PlannedEntry;
 use crate::model::RawEvent;
 use crate::pipeline::{Pipeline, QUEUE_CAPACITY};
 use crate::store::Store;
@@ -721,8 +722,10 @@ impl Drop for Session {
 #[derive(Clone, Debug)]
 pub struct HostsAuto {
     pub enabled: bool,
-    /// Which process's domain table is kept in step.
-    pub process: String,
+    /// Which processes' domain tables are kept in step. Several at once are
+    /// folded into one write, so a name two of them resolved becomes one line
+    /// with both owners.
+    pub processes: Vec<String>,
     pub policy: crate::hosts::NoAaaaPolicy,
     /// The plan we are waiting to settle, and when it last changed.
     pending: Option<(u64, std::time::Instant)>,
@@ -731,11 +734,22 @@ pub struct HostsAuto {
     pub last_note: String,
 }
 
+impl HostsAuto {
+    /// The processes as one line, for a status message or a note.
+    pub fn label(&self) -> String {
+        match self.processes.len() {
+            0 => "(未选择进程)".to_string(),
+            1 => self.processes[0].clone(),
+            n => format!("{} 等 {n} 个进程", self.processes[0]),
+        }
+    }
+}
+
 impl Default for HostsAuto {
     fn default() -> Self {
         Self {
             enabled: false,
-            process: String::new(),
+            processes: Vec::new(),
             policy: crate::hosts::NoAaaaPolicy::default(),
             pending: None,
             writes: 0,
@@ -896,7 +910,7 @@ impl Session {
         process: &str,
         policy: crate::hosts::NoAaaaPolicy,
     ) -> anyhow::Result<HostsOutcome> {
-        self.hosts_write_impl(process, policy, false, None)
+        self.hosts_write_impl(process, policy, None)
     }
 
     /// Write only the named domains of one process's table.
@@ -912,17 +926,16 @@ impl Session {
         policy: crate::hosts::NoAaaaPolicy,
         domains: &[String],
     ) -> anyhow::Result<HostsOutcome> {
-        self.hosts_write_impl(process, policy, false, Some(domains))
+        self.hosts_write_impl(process, policy, Some(domains))
     }
 
-    /// `auto` only changes what the change log says the write was: the merge
-    /// itself is the same one the user gets, so automatic and manual writes can
-    /// never drift apart.
+    /// The single-process merge. Multi-process and automatic writes go through
+    /// [`Self::write_owned`], which uses the same merge rules but folds several
+    /// tables into one file change.
     fn hosts_write_impl(
         &mut self,
         process: &str,
         policy: crate::hosts::NoAaaaPolicy,
-        auto: bool,
         only: Option<&[String]>,
     ) -> anyhow::Result<HostsOutcome> {
         let mut rows = self.hosts_preview(process, policy)?;
@@ -970,7 +983,168 @@ impl Session {
             note: format!("{process}：{}", write_note(&m)),
             ..Default::default()
         };
-        self.log_hosts_change(if auto { "auto_write" } else { "write" }, process, &out);
+        self.log_hosts_change("write", process, &out);
+        self.note(NoteLevel::Info, out.note.clone());
+        Ok(out)
+    }
+
+    /// Fold several processes' domain tables into the managed block at once.
+    ///
+    /// Rows for the same name are merged into one line carrying every process
+    /// that asked for it, so two processes cannot produce two competing lines
+    /// for one domain. One file change, one backup.
+    pub fn hosts_write_many(
+        &mut self,
+        processes: &[String],
+        policy: crate::hosts::NoAaaaPolicy,
+        domains: Option<&[String]>,
+    ) -> anyhow::Result<HostsOutcome> {
+        if processes.is_empty() {
+            anyhow::bail!("没有选择要写入的进程");
+        }
+        if processes.len() == 1 {
+            return match domains {
+                Some(list) => self.hosts_write_selected(&processes[0], policy, list),
+                None => self.hosts_write(&processes[0], policy),
+            };
+        }
+        let (rows, conflicts) = self
+            .collect_plans(processes, policy, domains, false)
+            .unwrap_or_default();
+        let label = format!("{} 等 {} 个进程", processes[0], processes.len());
+        self.write_owned(&rows, conflicts, &label, false, domains.is_some())
+    }
+
+    /// Build one plan from several processes, merging rows that name the same
+    /// domain. Returns the rows and how many domains had differing addresses
+    /// between processes (the first usable one wins).
+    ///
+    /// `live_only` is automatic mode's rule: restored rows are history, and a
+    /// process whose lookups have not all settled is not written yet. It
+    /// returns `None` when any process is not ready.
+    fn collect_plans(
+        &self,
+        processes: &[String],
+        policy: crate::hosts::NoAaaaPolicy,
+        only: Option<&[String]>,
+        live_only: bool,
+    ) -> Option<(Vec<(Vec<String>, PlannedEntry)>, usize)> {
+        let mut merged: Vec<(Vec<String>, PlannedEntry)> = Vec::new();
+        let mut index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // One entry per domain whose processes disagreed, so the note says
+        // "N domains", not "N disagreements".
+        let mut conflicts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for process in processes {
+            let live: Vec<(String, crate::domains::AaaaEntry)> = if live_only {
+                let rows: Vec<_> = self
+                    .domains
+                    .rows_for(process)
+                    .into_iter()
+                    .filter(|(_, e)| !e.archived)
+                    .collect();
+                if rows.is_empty() || rows.iter().any(|(_, e)| !e.settled()) {
+                    return None;
+                }
+                rows
+            } else {
+                self.domains.rows_for(process)
+            };
+            for entry in Self::plan_rows(&live, policy) {
+                if let Some(selected) = only {
+                    if !selected.iter().any(|d| d.eq_ignore_ascii_case(&entry.domain)) {
+                        continue;
+                    }
+                }
+                let key = entry.domain.to_ascii_lowercase();
+                match index.get(&key).copied() {
+                    None => {
+                        index.insert(key, merged.len());
+                        merged.push((vec![process.clone()], entry));
+                    }
+                    Some(i) => {
+                        let (owners, existing) = &mut merged[i];
+                        if !owners.iter().any(|o| o.eq_ignore_ascii_case(process)) {
+                            owners.push(process.clone());
+                        }
+                        existing.previous_session |= entry.previous_session;
+                        // Address choice: a real IPv6 answer always beats the
+                        // loopback block, and an answer beats "skip". Two
+                        // different IPv6 answers cannot both be written, so the
+                        // first is kept and the disagreement is reported.
+                        let existing_usable = !existing.address.is_empty()
+                            && existing.address != crate::hosts::BLOCK_ADDRESS;
+                        let new_usable = !entry.address.is_empty()
+                            && entry.address != crate::hosts::BLOCK_ADDRESS;
+                        if new_usable && !existing_usable {
+                            existing.address = entry.address;
+                            existing.reason = entry.reason;
+                        } else if new_usable
+                            && existing_usable
+                            && !existing.address.eq_ignore_ascii_case(&entry.address)
+                        {
+                            conflicts.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        Some((merged, conflicts.len()))
+    }
+
+    /// Merge prepared rows into the file, with one backup and one change-log
+    /// entry. Shared by manual multi-process writes and automatic mode.
+    fn write_owned(
+        &mut self,
+        rows: &[(Vec<String>, PlannedEntry)],
+        conflicts: usize,
+        label: &str,
+        auto: bool,
+        subset: bool,
+    ) -> anyhow::Result<HostsOutcome> {
+        let file = self.load_hosts()?;
+        let m = crate::hosts::merge_owned(&file, rows);
+        if !m.changed {
+            let note = if rows.is_empty() {
+                if subset {
+                    "所选域名没有可写入的条目，hosts 未做改动".to_string()
+                } else {
+                    format!("{label} 目前没有可写入的域名，hosts 未做改动")
+                }
+            } else {
+                format!(
+                    "{label}：没有需要写入的改动（{} 条已写入的域名保持原样，{} 条按策略跳过）",
+                    m.kept, m.skipped
+                )
+            };
+            return Ok(HostsOutcome {
+                path: self.hosts_path(),
+                kept: m.kept,
+                skipped: m.skipped,
+                unchanged: true,
+                note,
+                ..Default::default()
+            });
+        }
+        let backup = file.write(&m.bytes, &self.hosts_backup_dir()).ok();
+        let mut note = format!("{label}：{}", write_note(&m));
+        if conflicts > 0 {
+            note.push_str(&format!(
+                "；{conflicts} 个域名在不同进程里解析结果不同，已取先出现的可用地址"
+            ));
+        }
+        let out = HostsOutcome {
+            path: self.hosts_path(),
+            backup,
+            appended: m.appended,
+            upgraded: m.upgraded,
+            claimed: m.claimed,
+            kept: m.kept,
+            skipped: m.skipped,
+            note,
+            ..Default::default()
+        };
+        self.log_hosts_change(if auto { "auto_write" } else { "write" }, label, &out);
         self.note(NoteLevel::Info, out.note.clone());
         Ok(out)
     }
@@ -1102,21 +1276,26 @@ impl Session {
     }
 
     /// Turn automatic mode on or off.
-    pub fn set_hosts_auto(&mut self, on: bool, process: Option<String>) {
+    ///
+    /// `processes` of `Some` replaces the set being followed; several are
+    /// allowed, and their rows are merged into one write so a shared domain
+    /// gets one line with every owner on it.
+    pub fn set_hosts_auto(&mut self, on: bool, processes: Option<Vec<String>>) {
         self.hosts_auto.enabled = on;
-        if let Some(p) = process {
-            self.hosts_auto.process = p;
+        if let Some(list) = processes {
+            let mut seen = std::collections::HashSet::new();
+            self.hosts_auto.processes = list
+                .into_iter()
+                .filter(|p| !p.is_empty())
+                .filter(|p| seen.insert(p.to_ascii_lowercase()))
+                .collect();
         }
         // A fresh decision: forget any plan that was mid-debounce.
         self.hosts_auto.pending = None;
         let m = if on {
             format!(
                 "自动写入已开启：{} 的域名表变化后将自动写入 hosts（无 IPv6 的域名：{}）",
-                if self.hosts_auto.process.is_empty() {
-                    "(未选择进程)"
-                } else {
-                    &self.hosts_auto.process
-                },
+                self.hosts_auto.label(),
                 self.hosts_auto.policy.label()
             )
         } else {
@@ -1131,10 +1310,10 @@ impl Session {
     /// Called from the UI tick and from the streaming loop; cheap when disabled
     /// or when nothing has changed.
     pub fn hosts_auto_tick(&mut self) -> Option<HostsOutcome> {
-        if !self.hosts_auto.enabled || self.hosts_auto.process.is_empty() {
+        if !self.hosts_auto.enabled || self.hosts_auto.processes.is_empty() {
             return None;
         }
-        let process = self.hosts_auto.process.clone();
+        let processes = self.hosts_auto.processes.clone();
         let policy = self.hosts_auto.policy;
 
         // Wait for the lookups. A name whose AAAA answer has not arrived would
@@ -1144,48 +1323,42 @@ impl Session {
         // record of what happened last time, not evidence about now; writing it
         // back would re-assert addresses that may be days old without anything
         // having resolved them.
-        let live: Vec<(String, crate::domains::AaaaEntry)> = self
-            .domains
-            .rows_for(&process)
-            .into_iter()
-            .filter(|(_, e)| !e.archived)
-            .collect();
-        if live.is_empty() || live.iter().any(|(_, e)| !e.settled()) {
-            return None;
-        }
-
-        let plan = Self::plan_rows(&live, policy);
-        if plan.is_empty() {
+        let (rows, conflicts) = match self.collect_plans(&processes, policy, None, true) {
+            Some(v) => v,
+            None => return None,
+        };
+        if rows.is_empty() {
             // Never remove automatically. Clearing the block stays a deliberate
             // action, so a missing domain table cannot silently wipe it.
             return None;
         }
 
         // Ask the merge itself whether there is anything to do, rather than
-        // comparing the whole block with this process's plan: the block holds
-        // other processes' entries too, and comparing the two would report a
+        // comparing the whole block with this plan: the block holds other
+        // processes' entries too, and comparing the two would report a
         // difference on every tick and rewrite the file forever.
         let file = self.load_hosts().ok()?;
-        if !crate::hosts::merge(&file, &process, &plan).changed {
+        if !crate::hosts::merge_owned(&file, &rows).changed {
             self.hosts_auto.pending = None;
             return None;
         }
 
         // Debounce: only write once the plan has held still.
-        let fingerprint = fingerprint(&plan);
+        let fp = fingerprint(&rows);
         match &self.hosts_auto.pending {
-            Some((fp, since)) if *fp == fingerprint => {
+            Some((pending_fp, since)) if *pending_fp == fp => {
                 if since.elapsed() < crate::hosts::AUTO_DEBOUNCE {
                     return None;
                 }
             }
             _ => {
-                self.hosts_auto.pending = Some((fingerprint, std::time::Instant::now()));
+                self.hosts_auto.pending = Some((fp, std::time::Instant::now()));
                 return None;
             }
         }
 
-        let outcome = self.hosts_write_impl(&process, policy, true, None).ok()?;
+        let label = self.hosts_auto.label();
+        let outcome = self.write_owned(&rows, conflicts, &label, true, false).ok()?;
         self.hosts_auto.pending = None;
         self.hosts_auto.writes += 1;
         self.hosts_auto.last_note = format!("自动写入：{}", outcome.note);
@@ -1450,13 +1623,14 @@ pub enum EngineCommand {
         process: String,
         policy: crate::hosts::NoAaaaPolicy,
     },
-    /// Write one process's domains into the managed block.
+    /// Write one or more processes' domains into the managed block.
     ///
-    /// `domains` narrows the write to those names (the preview window's
-    /// multi-select); `None` means the whole table, which is what the plain
-    /// "write" button and automatic mode use.
+    /// `processes` may name several tables; rows for the same domain are merged
+    /// into one line with every owner. `domains` narrows the write to those
+    /// names (the preview window's multi-select); `None` means the whole table,
+    /// which is what the plain "write" button and automatic mode use.
     HostsWrite {
-        process: String,
+        processes: Vec<String>,
         policy: crate::hosts::NoAaaaPolicy,
         domains: Option<Vec<String>>,
     },
@@ -1483,18 +1657,21 @@ pub enum EngineCommand {
     /// Turn automatic writing on or off.
     HostsAuto {
         on: bool,
-        process: Option<String>,
+        processes: Vec<String>,
         policy: crate::hosts::NoAaaaPolicy,
     },
 }
 
 /// A cheap fingerprint of a plan, used to notice that it stopped changing.
-fn fingerprint(plan: &[crate::hosts::PlannedEntry]) -> u64 {
+fn fingerprint(rows: &[(Vec<String>, PlannedEntry)]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for e in plan {
+    for (owners, e) in rows {
         e.address.hash(&mut h);
         e.domain.hash(&mut h);
+        for owner in owners {
+            owner.hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -1505,6 +1682,33 @@ fn parse_policy(v: &serde_json::Value) -> crate::hosts::NoAaaaPolicy {
         Some("skip") => crate::hosts::NoAaaaPolicy::Skip,
         _ => crate::hosts::NoAaaaPolicy::Block,
     }
+}
+
+/// Parse the process list of a `hosts_write` / `hosts_auto` command.
+///
+/// The current protocol sends `processes` (an array); `process` (a single
+/// string) is still accepted so an older GUI keeps working.
+fn parse_processes(v: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .get("processes")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if out.is_empty() {
+        if let Some(p) = v.get("process").and_then(|p| p.as_str()) {
+            out.push(p.to_string());
+        }
+    }
+    // One process can legitimately appear twice only through a bug; writing it
+    // twice would not break anything but would double the owner marker.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| !p.is_empty() && seen.insert(p.to_ascii_lowercase()));
+    out
 }
 
 /// Parse the optional `domains` field of a `hosts_write` command.
@@ -1570,11 +1774,7 @@ pub fn spawn_command_reader() -> Option<crossbeam_channel::Receiver<EngineComman
                         policy: parse_policy(&v),
                     },
                     Some("hosts_write") => EngineCommand::HostsWrite {
-                        process: v
-                            .get("process")
-                            .and_then(|p| p.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
+                        processes: parse_processes(&v),
                         policy: parse_policy(&v),
                         // Only present when the GUI asks for a subset. An empty
                         // array is a real selection of nothing, so it is kept as
@@ -1630,10 +1830,7 @@ pub fn spawn_command_reader() -> Option<crossbeam_channel::Receiver<EngineComman
                     },
                     Some("hosts_auto") => EngineCommand::HostsAuto {
                         on: v.get("on").and_then(|b| b.as_bool()).unwrap_or(false),
-                        process: v
-                            .get("process")
-                            .and_then(|p| p.as_str())
-                            .map(|s| s.to_string()),
+                        processes: parse_processes(&v),
                         policy: parse_policy(&v),
                     },
                     Some("hosts_backup") => EngineCommand::HostsBackup,
@@ -2034,7 +2231,7 @@ mod tests {
         let (base, data, hosts) = cache_fixture("autocache");
         let mut s = session_with_cache(&base, &data, &hosts, "NetMonAutoCache");
         s.load_domain_cache();
-        s.set_hosts_auto(true, Some("edge.exe".into()));
+        s.set_hosts_auto(true, Some(vec!["edge.exe".into()]));
         for _ in 0..5 {
             assert!(s.hosts_auto_tick().is_none());
         }
@@ -2059,6 +2256,18 @@ mod tests {
             parse_selected_domains(&some),
             Some(vec!["a.example.com".to_string(), "b.example.com".to_string()])
         );
+    }
+
+    /// The process list accepts the new array and the old single field.
+    #[test]
+    fn the_process_list_accepts_both_protocol_forms() {
+        let both = serde_json::json!({"processes": ["a.exe", "b.exe"]});
+        assert_eq!(parse_processes(&both), vec!["a.exe", "b.exe"]);
+        let legacy = serde_json::json!({"process": "a.exe"});
+        assert_eq!(parse_processes(&legacy), vec!["a.exe"]);
+        let deduped = serde_json::json!({"processes": ["A.exe", "a.exe", ""]});
+        assert_eq!(parse_processes(&deduped), vec!["A.exe"]);
+        assert!(parse_processes(&serde_json::json!({})).is_empty());
     }
 
     #[test]

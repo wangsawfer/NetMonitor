@@ -1,13 +1,14 @@
 # NetMonitor 测试报告
 
-版本 1.0.0 · 2026-10-14
+版本 1.1.0 · 2026-10-18
 
 > **修订说明**：终端界面（TUI）已移除，`netmon.exe` 只保留无界面输出与
 > `--stream-json`，交互界面只剩图形界面。因此本报告中
 > §3 的 `ui::render` / `ui` / `ui::input` / `ui::filedlg` 测试、§5.1–§5.4 的
 > 终端界面验证，都是**移除前**的历史记录，不再可复现；§5.5 图形界面验证仍适用。
-> 当时的 149 项测试里，渲染与输入相关的数十项随 TUI 一起删除；当前为 **118 项**
-> （`cargo test --bins`），并新增了“按所选域名写入”的回归测试。
+> 当时的 149 项测试里，渲染与输入相关的数十项随 TUI 一起删除；当前为 **125 项**
+> （`cargo test --bins`）。1.1.0 新增：多进程合并写入（`merge_owned`）、多进程自动
+> 模式、目标列表按名称添加、hosts 进程右键选择；对应回归见文末 §8。
 
 ---
 
@@ -997,5 +998,27 @@ python -I .cache/test/pp4.py .cache/target/release/netmon.exe
 python -I .cache/test/guitest_hosts.py
 ```
 
-上面 4 个驱动对 **release 产物**和 **`dist\NetMonitor-1.0.0-win64\` 发布包**各跑一遍，
+上面 4 个驱动对 **release 产物**和 **`dist\NetMonitor-1.1.0-win64\` 发布包**各跑一遍，
 结果一致（全部通过）。
+
+---
+
+## 8. 1.1.0 增量验证（2026-10-18）
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --bins` | **125 项全部通过**（新增 `merge_owned` 三项、进程参数解析一项） |
+| `cargo check --all-targets` | 通过；测试构建保留两条原有的 dead-code 警告 |
+| 单进程 hosts 端到端（`e2e_hosts_subset.py`） | 16 项通过（旧协议 `process` 仍兼容） |
+| 多进程合并端到端（`e2e_multi.py`） | 15 项通过：两个目标各成根、一次写入产生两行且每行同时记录两个进程、单行删除只删一行、**多进程自动模式把删掉的行补回并合并归属** |
+| 图形界面烟雾测试（`smoke_multi_gui.py`） | 21 项通过：文件/名称目标同列表、右键移除/清空、hosts 进程右键选择与绿色标记、多进程写入/自动命令带 `processes[]` |
+| 单文件 exe 构建 | `NetMonitor-1.1.0-portable.exe`（约 11 MB）；`--selftest` 确认内置引擎存在、`wpcap` 可加载；实际启动并抓到 testapp 的 DNS 记录（截图验证） |
+| 便携文件夹包 | `scripts/package.ps1` 仍可用，产物 `NetMonitor-1.1.0-win64.zip` |
+
+新增测试的固定事实：
+
+- 两个进程解析同一域名时，`hosts` 里只有一行，`# nm a.exe,b.exe` 同时记录两者；
+  地址冲突时保留先出现的可用 IPv6 地址并记录两个归属。
+- 自动模式在任一进程仍有未落定的 AAAA 查询时不写；全部落定且计划稳定 1.5 秒后
+  合并写入一次、一次备份。
+- 关闭文件后重新读取（`hosts_read`）不会把用户主动“全不选”恢复成默认进程。

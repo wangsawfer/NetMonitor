@@ -725,6 +725,95 @@ pub fn merge(file: &HostsFile, process: &str, plan: &[PlannedEntry]) -> Merge {
     out
 }
 
+/// Fold several processes' plans into the block in one pass.
+///
+/// This exists for the case where two processes resolved the same name: their
+/// rows are merged beforehand into one row with both owners, and this writes
+/// that row once, with one backup. Calling [`merge`] twice would produce the
+/// same lines but two rewrites of the file -- and, in automatic mode, two
+/// debounce cycles for one page load.
+///
+/// An address already in the block is never replaced by a different working
+/// address, exactly as in [`merge`]: the only correction is the block address
+/// becoming a real IPv6 one.
+pub fn merge_owned(file: &HostsFile, rows: &[(Vec<String>, PlannedEntry)]) -> Merge {
+    let mut entries = file.block_entries();
+    let all = file.all_entries();
+    let mut out = Merge {
+        bytes: file.raw.clone(),
+        ..Default::default()
+    };
+    for (owners, p) in rows {
+        if p.reason == PlanReason::SkippedNoIpv6 {
+            out.skipped += 1;
+            continue;
+        }
+        match entries
+            .iter()
+            .position(|b| b.domain.eq_ignore_ascii_case(&p.domain))
+        {
+            None => {
+                if all.iter().any(|(_, n)| n.eq_ignore_ascii_case(&p.domain)) {
+                    // The user's own line already decides this name.
+                    out.skipped += 1;
+                } else {
+                    entries.push(BlockEntry::new(
+                        p.address.clone(),
+                        p.domain.clone(),
+                        owners.clone(),
+                    ));
+                    out.appended += 1;
+                }
+            }
+            Some(i) => {
+                let e = &mut entries[i];
+                if e.address.eq_ignore_ascii_case(&p.address) {
+                    let mut claimed = false;
+                    for owner in owners {
+                        if !e.is_owned_by(owner) {
+                            e.claim(owner);
+                            claimed = true;
+                        }
+                    }
+                    if claimed {
+                        out.claimed += 1;
+                    } else {
+                        out.kept += 1;
+                    }
+                } else if e.address == BLOCK_ADDRESS && p.address != BLOCK_ADDRESS {
+                    e.address = p.address.clone();
+                    e.raw = None;
+                    for owner in owners {
+                        e.claim(owner);
+                    }
+                    out.upgraded += 1;
+                } else {
+                    // A working address already in the block is never replaced
+                    // by a different one. Both processes still rely on the
+                    // name, so both are recorded as owners.
+                    let mut claimed = false;
+                    for owner in owners {
+                        if !e.is_owned_by(owner) {
+                            e.claim(owner);
+                            claimed = true;
+                        }
+                    }
+                    if claimed {
+                        out.claimed += 1;
+                    } else {
+                        out.kept += 1;
+                    }
+                }
+            }
+        }
+    }
+    out.changed = out.appended + out.upgraded + out.claimed > 0;
+    if out.changed {
+        out.bytes = file.render_block(&entries);
+    }
+    out
+}
+
 /// Take one process's name off the entries it put there.
 ///
 /// A line that only this process asked for goes away. A line it shares with
@@ -1615,6 +1704,59 @@ mod tests {
         assert!(list_backups(&dir).len() >= 8);
         assert!(prune_backups(&dir, 3) >= 5);
         assert_eq!(list_backups(&dir).len(), 3);
+    }
+
+    #[test]
+    fn merge_owned_writes_one_line_for_several_owners() {
+        let p = write_temp("owned.hosts", SAMPLE);
+        let f = HostsFile::load(&p).unwrap();
+        let rows = vec![(
+            names(&["a.exe", "b.exe"]),
+            entry("2606:4700::9", "shared.example.com"),
+        )];
+        let m = merge_owned(&f, &rows);
+        assert_eq!(m.appended, 1);
+        let after = reload(&p, m.bytes);
+        assert_eq!(after.block_entries().len(), 1);
+        assert_eq!(
+            after.owners_summary(),
+            vec![("a.exe".to_string(), 1), ("b.exe".to_string(), 1)],
+            "both processes own the single line"
+        );
+        assert!(after.contents().contains("2606:4700::9"));
+        // Running it again changes nothing: all owners are already recorded.
+        assert!(!merge_owned(&after, &rows).changed);
+    }
+
+    #[test]
+    fn merge_owned_keeps_a_working_address_and_records_the_other_owner() {
+        let p = write_temp("owned-conflict.hosts", SAMPLE);
+        let f = HostsFile::load(&p).unwrap();
+        let first = vec![(names(&["a.exe"]), entry("2606:4700::1", "cdn.example.com"))];
+        let after = reload(&p, merge_owned(&f, &first).bytes);
+        // b.exe resolved the same name to a different address: one line can
+        // only hold one address, so the existing one stays and b is recorded.
+        let second = vec![(names(&["b.exe"]), entry("2606:4700::2", "cdn.example.com"))];
+        let m = merge_owned(&after, &second);
+        let after = reload(&p, m.bytes);
+        let entries = after.block_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].address, "2606:4700::1");
+        assert_eq!(entries[0].owners, names(&["a.exe", "b.exe"]));
+    }
+
+    #[test]
+    fn merge_owned_upgrades_a_blocked_line_and_claims_it() {
+        let p = write_temp("owned-upgrade.hosts", SAMPLE);
+        let f = HostsFile::load(&p).unwrap();
+        let blocked = vec![(names(&["a.exe"]), entry(BLOCK_ADDRESS, "x.example.com"))];
+        let after = reload(&p, merge_owned(&f, &blocked).bytes);
+        let upgraded = vec![(names(&["b.exe"]), entry("2606:4700::3", "x.example.com"))];
+        let m = merge_owned(&after, &upgraded);
+        assert_eq!(m.upgraded, 1);
+        let after = reload(&p, m.bytes);
+        assert_eq!(after.block_entries()[0].address, "2606:4700::3");
+        assert_eq!(after.block_entries()[0].owners, names(&["a.exe", "b.exe"]));
     }
 
     #[test]

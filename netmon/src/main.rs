@@ -425,7 +425,8 @@ fn headless(cli: &Cli) -> ExitCode {
                 "claimed": outcome.claimed,
                 "kept": outcome.kept,
                 "skipped": outcome.skipped,
-                "process": session.hosts_auto.process,
+                "process": session.hosts_auto.processes.first(),
+                "processes": session.hosts_auto.processes,
                 "writes": session.hosts_auto.writes,
             }));
         }
@@ -465,17 +466,17 @@ fn headless(cli: &Cli) -> ExitCode {
                         emit_json(&hosts_preview_json(&process, policy, &annotated));
                     }
                     crate::app::EngineCommand::HostsWrite {
-                        process,
+                        processes,
                         policy,
                         domains,
                     } => {
                         // A subset is a different request, not a flag on the
                         // whole-table write: the selection decides which rows
                         // are planned, while every write rule stays the same.
-                        let result = match &domains {
-                            Some(list) => session.hosts_write_selected(&process, policy, list),
-                            None => session.hosts_write(&process, policy),
-                        };
+                        // Several processes are folded into one write, so a
+                        // shared domain gets one line with all its owners.
+                        let result =
+                            session.hosts_write_many(&processes, policy, domains.as_deref());
                         match result {
                             Ok(o) => emit_json(&hosts_outcome_json("hosts_written", true, &o, &session)),
                             Err(e) => emit_json(&serde_json::json!({
@@ -601,13 +602,16 @@ fn headless(cli: &Cli) -> ExitCode {
                             "note": format!("备份失败：{e}"),
                         })),
                     },
-                    crate::app::EngineCommand::HostsAuto { on, process, policy } => {
+                    crate::app::EngineCommand::HostsAuto { on, processes, policy } => {
                         session.hosts_auto.policy = policy;
-                        session.set_hosts_auto(on, process);
+                        session.set_hosts_auto(on, Some(processes));
                         emit_json(&serde_json::json!({
                             "type": "hosts_auto",
                             "enabled": session.hosts_auto.enabled,
-                            "process": session.hosts_auto.process,
+                            // `process` stays for older GUIs; `processes` is
+                            // the real field now.
+                            "process": session.hosts_auto.processes.first(),
+                            "processes": session.hosts_auto.processes,
                             "note": session.hosts_auto.last_note,
                         }));
                     }

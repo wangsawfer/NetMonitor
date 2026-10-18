@@ -1,7 +1,5 @@
 # NetMonitor
 
-[![CI](https://github.com/wangsawfer/NetMonitor/actions/workflows/ci.yml/badge.svg)](https://github.com/wangsawfer/NetMonitor/actions/workflows/ci.yml)
-
 **Windows 11 上针对指定应用程序及其子进程的事件驱动 DNS 监控工具。**
 
 给出一个可执行文件路径（可多个），NetMonitor 会**先建立监控、再启动该程序**，
@@ -32,9 +30,10 @@ drops: none   DNS 137  domains 42  rate 8.6/s  cpu 0.4%  …            ▁▃�
 - **子进程全覆盖**：自动跟踪目标派生的全部后代进程
 - **多源互补**：ETW + Npcap 明文抓包 + TLS SNI（应对自带解析器与 DoH）
 - **纯事件驱动**：捕获路径阻塞等待内核事件，无任何定时轮询；界面按数据到达刷新
-- **零依赖运行**：静态链接 MSVC 运行库，干净系统上可直接运行（Npcap 可选）
-- **一个引擎、两种用法**：图形界面（`run-netmon-gui.cmd`，Python + tkinter）或
-  无界面逐行输出（`--stream-json` / 纯文本），抓取能力完全相同
+- **零依赖运行**：静态链接 MSVC 运行库；只需安装 Npcap 驱动（安装程序随包提供），
+  干净系统上即可运行
+- **一个引擎、两种用法**：单文件图形界面（`NetMonitor-<版本>-portable.exe`，内置
+  Python 运行时）或 无界面逐行输出（`--stream-json` / 纯文本），抓取能力完全相同
 - **界面功能**：实时列表、暂停/恢复、清空、过滤、导出 CSV/JSON、统计、诊断日志
 - **自愈**：自动清理被强杀后残留的 ETW 会话——否则它会让工具"看起来完全没有输出"
 - **域名表 + AAAA 查询**：每个进程一张去重域名表，独立线程池批量查 AAAA 记录，
@@ -46,9 +45,15 @@ drops: none   DNS 137  domains 42  rate 8.6/s  cpu 0.4%  …            ▁▃�
 
 ## 下载
 
-- **发布包**：[Releases](https://github.com/wangsawfer/NetMonitor/releases)
-  （`NetMonitor-1.0.0-win64.zip`，解压即用；含 exe、图形界面、文档与源码）
-- 单独的可执行文件：同一 Release 里的 `netmon.exe`（无界面 / `--stream-json` 引擎）
+- **单文件版**：[Releases](https://github.com/wangsawfer/NetMonitor/releases) 里的
+  `NetMonitor-1.1.0-portable.exe`（约 11 MB）——双击即用，不需要安装 Python，
+  也没有 `.cmd` 启动器；内置图形界面、抓包引擎和 Npcap 安装程序
+- **便携文件夹版**：`NetMonitor-1.1.0-win64.zip`——解压即用，含引擎、Python
+  源码界面、Npcap 安装器、文档与源码；适合需要看代码或自定义的人
+- **单独引擎**：同一 Release 里的 `netmon.exe`（无界面 / `--stream-json`）
+
+> 两种图形界面版本都需要 Npcap 驱动。单文件版首次启动发现缺少驱动时，会询问并
+> 直接用内置的安装程序安装；文件夹版可运行 `install-npcap.cmd`。
 
 ## 快速开始
 
@@ -69,13 +74,14 @@ python gui\netmon_gui.py
 发布包用户：
 
 ```cmd
-install-npcap.cmd     :: 安装 Npcap 驱动（可选，会自动提权）
-run-netmon-gui.cmd    :: 图形界面（需要 Python 3，会自动提权）
+NetMonitor-1.1.0-portable.exe     :: 单文件版：双击即可，首次会提示安装 Npcap
+install-npcap.cmd                :: 文件夹版：安装 Npcap 驱动（会自动提权）
+run-netmon-gui.cmd               :: 文件夹版图形界面（需要 Python 3，会自动提权）
 run-netmon.cmd --app "C:\Path\To\App.exe"   :: 无界面，逐行输出（会自动提权）
 ```
 
 > 本版本已**移除终端界面（TUI）**。`netmon.exe` 是抓包引擎与可脚本化的前端，
-> 交互操作请用 `run-netmon-gui.cmd`。
+> 交互操作请用单文件版或 `run-netmon-gui.cmd`。
 
 ## 命令行
 
@@ -101,9 +107,10 @@ run-netmon.cmd --app "C:\Path\To\App.exe"   :: 无界面，逐行输出（会自
 ## 同时监控多个程序
 
 `--app` 可以重复：每个程序都会作为**同一棵进程树**的一个根，它们派生的子进程
-一起被监视；`--attach` 也可以重复，每个映像名会收编其全部进程。图形界面里
-「浏览…」后点「添加」可以建立目标列表，按名称监视框里也能填多个映像名
-（逗号或空格分隔）。
+一起被监视；`--watch` 也可以重复，每个映像名会收编其全部进程。图形界面里
+「浏览…」+「添加」可以加入可执行文件，也可以把「按名称监视」里的映像名
+（逗号或空格分隔）点「添加名称」加入**同一个目标列表**；右键列表可以移除选中
+或清空。
 
 ```cmd
 netmon.exe --app "C:\App\main.exe" --app "C:\Tools\updater.exe"
@@ -142,7 +149,8 @@ DNS 服务器再慢也不会拖慢监控。
 
 把域名表写进 hosts 文件：有可用 IPv6 的域名写它的最优 IPv6 地址；
 没有 IPv6 的默认指向 `127.0.0.1` 禁用（可切换为不写入）。
-**可以一次选中多个进程一起写**（每个进程各写一次、各备份一次）。
+**可以一次选中多个进程，合并成一次写入**（一个文件改动、一次备份）；两个进程
+写入同一条域名时合并为一行，`# nm` 后并列记录两个归属。
 
 **写入是按进程的，而且只增不删**：没写过的域名追加，已经写过的原样不动
 （唯一例外是原来因查不到 IPv6 而写成 `127.0.0.1`、现在有 IPv6 了的，会更新成
@@ -155,14 +163,18 @@ IPv6 地址），也不会重复写第二行。删除是另外的、需要你点
 程序内可以查看和编辑。
 
 **写入范围可以是整张表，也可以是选中的几条**：在预览表里 `Ctrl` 多选、右键
-「写入所选域名」即可；选中的行可以跨进程，写入时按进程分组，规则不变。
+「写入所选域名」即可；选中的行可以跨进程，引擎会合并成一次写入，规则不变。
 
 **「当前条目」支持右键**：`复制该行`（原样复制 hosts 里的那一行）和
 `删除该行…`（只删这一行；若该行同时属于多个进程，会明确提示，删除前自动备份）。
 
-**自动模式**：打开后所选进程的域名表一有变化就自动写入（一次只针对一个进程）。
-会等 AAAA 查询全部落定、且计划稳定 1.5 秒后才写，避免把还没查到 IPv6 的域名先写成
-127.0.0.1。只写入、不删除条目，也不清理备份。预览随域名表自动更新（没有「预览」按钮），
+**进程选择支持右键**：在「写入」标签页的进程列表上右键，选择/取消选择、
+全选或全不选；已选择的进程显示为绿色，预览与写入都跟着这个集合走。
+
+**自动模式**：打开后已选进程（可多个）的域名表一有变化就自动写入；两个进程
+写入同一条域名时合并为一行、记录两个归属。会等所有进程的 AAAA 查询全部落定、
+且计划稳定 1.5 秒后才写，避免把还没查到 IPv6 的域名先写成 127.0.0.1。只写入、
+不删除条目，也不清理备份。预览随域名表自动更新（没有「预览」按钮），
 每条域名同时标注「文件里的现状」和「本次写入会做什么」。
 
 **跨重启**：域名表和每一次 hosts 改动都缓存在程序旁的 `netmon-data\`
@@ -221,8 +233,8 @@ netmon.exe --attach msedge.exe --keep-alive
 |---|---|
 | 操作系统 | Windows 11（Windows 10 1809+ 亦可） |
 | 权限 | **管理员**（ETW 实时会话与 Npcap 驱动都需要） |
-| 运行库 | 无（静态链接 MSVC 运行库） |
-| Npcap | 可选。缺失时 ETW 主源仍可用，只是失去自带解析器应用的覆盖与 SNI 补充 |
+| 运行库 | 无（静态链接 MSVC 运行库；单文件版还内置 Python 运行时） |
+| Npcap | **必需**（引擎在加载时链接 `wpcap.dll`）。单文件版会提示并可用内置安装器安装；文件夹版运行 `install-npcap.cmd` |
 
 ## 工作原理（简版）
 
@@ -251,7 +263,13 @@ powershell -ExecutionPolicy Bypass -File scripts\verify.ps1
 
 # 打包到 dist\
 powershell -ExecutionPolicy Bypass -File scripts\package.ps1
+
+# 单文件 exe（PyInstaller 装进项目内的 .toolenv，不装到系统）
+powershell -ExecutionPolicy Bypass -File scripts\package-exe.ps1
 ```
+
+`package.ps1` 产出的便携文件夹仍然保留；`package-exe.ps1` 额外产出
+`dist\NetMonitor-<版本>-portable.exe`（约 11 MB，双击即用）及同名 zip。
 
 ## 项目结构
 
@@ -278,6 +296,7 @@ ipv6/
 ├── docs/                    手册与测试报告
 ├── dist/                    打包产物
 ├── .toolchain/              Rust 工具链（非 C 盘）
+├── .toolenv/                单文件打包用的本地 Python 依赖（不入库）
 └── .cache/                  下载缓存、构建产物、验证证据
 ```
 

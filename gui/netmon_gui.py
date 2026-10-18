@@ -73,8 +73,27 @@ ACTION_TAGS = {
 # 引擎位置
 # ---------------------------------------------------------------------------
 
+def frozen_bundle_dir() -> Optional[Path]:
+    """Where a one-file build unpacks its bundled files, if this is one."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return None
+
+
+def app_dir() -> Path:
+    """The folder the user sees: beside the exe when frozen, else the project."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def find_engine() -> Optional[Path]:
     """在常见位置寻找 netmon.exe。"""
+    bundle = frozen_bundle_dir()
+    if bundle is not None:
+        c = bundle / "netmon.exe"
+        if c.is_file():
+            return c
     here = Path(__file__).resolve().parent
     candidates = [
         here / "netmon.exe",
@@ -100,15 +119,21 @@ def is_admin() -> bool:
 def relaunch_as_admin() -> bool:
     """以管理员身份重新启动本程序。返回是否成功发起。"""
     try:
-        params = " ".join(f'"{a}"' for a in sys.argv)
-        exe = sys.executable
-        # pythonw 不存在时退回 python
-        pythonw = Path(exe).with_name("pythonw.exe")
-        if pythonw.is_file():
-            exe = str(pythonw)
-            params = f'"{Path(sys.argv[0]).resolve()}" ' + " ".join(
-                f'"{a}"' for a in sys.argv[1:]
-            )
+        if getattr(sys, "frozen", False):
+            # A one-file build has no Python and no script to pass: the exe is
+            # the program, and the rest of the command line is just arguments.
+            exe = sys.executable
+            params = " ".join(f'"{a}"' for a in sys.argv[1:])
+        else:
+            params = " ".join(f'"{a}"' for a in sys.argv)
+            exe = sys.executable
+            # pythonw 不存在时退回 python
+            pythonw = Path(exe).with_name("pythonw.exe")
+            if pythonw.is_file():
+                exe = str(pythonw)
+                params = f'"{Path(sys.argv[0]).resolve()}" ' + " ".join(
+                    f'"{a}"' for a in sys.argv[1:]
+                )
         rc = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", exe, params, None, 1
         )
@@ -345,6 +370,14 @@ class App(ttk.Frame):
         # their plans, one block per process.
         self._hosts_proc_list: Optional[tk.Listbox] = None
         self._hosts_procs: list[str] = []
+        # The processes whose plans are being written. Kept separate from the
+        # listbox's highlight: right-click toggles membership, and the chosen
+        # rows are drawn green.
+        self._hosts_chosen: list[str] = []
+        self._hosts_proc_hint: Optional[ttk.Label] = None
+        # Set once the user has chosen or cleared something, so a file reload
+        # does not silently put the default process back.
+        self._hosts_choice_made = False
         self._hosts_preview_by_process: dict[str, list[dict]] = {}
         self.hosts_preview: list[dict] = []
         self.hosts_meta: dict = {}
@@ -358,7 +391,6 @@ class App(ttk.Frame):
         self.hosts_entries: list[dict] = []
         self._hosts_entries_tree: Optional[ttk.Treeview] = None
         self._hosts_entries_info: Optional[ttk.Label] = None
-        self._hosts_entries_menu: Optional[tk.Menu] = None
         # Entry row id -> the line it shows, so the context menu can act on the
         # exact line that was clicked.
         self._hosts_entries_by_iid: dict[str, dict] = {}
@@ -418,27 +450,29 @@ class App(ttk.Frame):
         ttk.Button(target, text="添加", command=self.on_add_target,
                    width=8).grid(row=0, column=3, padx=(6, 0))
 
-        # 可以同时监控多个程序：列表里每个可执行文件都会作为同一棵进程树的一个根，
-        # 各自派生的子进程一起被监视。
-        self.targets: list[str] = []
+        # 可以同时监控多个程序：列表里每一项要么是可执行文件（启动它并监视
+        # 整棵进程树），要么是进程映像名（监视已在运行的和之后出现的）。
+        # 两种目标可以混在一起，右键管理这一份列表。
+        self.targets: list[tuple[str, str]] = []
         box_frame = ttk.Frame(target)
         box_frame.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0))
         box_frame.columnconfigure(0, weight=1)
-        self.targets_box = tk.Listbox(box_frame, height=3, exportselection=False,
-                                      font=("Consolas", 10), activestyle="none")
+        self.targets_box = tk.Listbox(box_frame, height=4, exportselection=False,
+                                      font=("Consolas", 10), activestyle="none",
+                                      selectmode="extended")
         self.targets_box.grid(row=0, column=0, sticky="ew")
         sb_targets = ttk.Scrollbar(box_frame, orient="vertical",
                                    command=self.targets_box.yview)
         sb_targets.grid(row=0, column=1, sticky="ns")
         self.targets_box.configure(yscrollcommand=sb_targets.set)
-        ttk.Label(target, text="要监控的程序（可多个）：", foreground="#666666").grid(
+        ttk.Label(target, text="要监控的程序（可多个，\n右键可移除 / 清空）：",
+                  foreground="#666666").grid(
             row=1, column=0, sticky="nw", pady=(6, 0))
-        btns = ttk.Frame(target)
-        btns.grid(row=1, column=3, sticky="n", padx=(6, 0), pady=(6, 0))
-        ttk.Button(btns, text="移除选中", command=self.on_remove_target,
-                   width=10).pack(fill="x")
-        ttk.Button(btns, text="清空", command=self.on_clear_targets,
-                   width=10).pack(fill="x", pady=(4, 0))
+        self.targets_box.bind("<Button-3>", self._on_targets_right_click)
+        self.targets_box.bind("<Delete>", lambda _e: self.on_remove_target())
+        self._targets_menu = tk.Menu(self.targets_box, tearoff=0)
+        self._targets_menu.add_command(label="移除选中", command=self.on_remove_target)
+        self._targets_menu.add_command(label="清空列表", command=self.on_clear_targets)
 
         ttk.Label(target, text="启动参数：").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.var_args = tk.StringVar()
@@ -447,13 +481,16 @@ class App(ttk.Frame):
 
         # 浏览器这类"单实例"程序，在已经打开的情况下再启动一个新进程，它会立刻
         # 把请求转交给已有实例并退出——真正的浏览器进程不是它的子进程，于是什么
-        # 都抓不到。按映像名附加到已在运行的进程才是可行的做法。
-        # 可以填多个映像名（逗号/空格分隔），每个名字都会持续监视。
-        ttk.Label(target, text="或按名称监视：").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        # 都抓不到。按映像名监视才是可行的做法。
+        # 名字会加入上面的同一个列表，和可执行文件一起作为本次监控的目标。
+        ttk.Label(target, text="按名称监视：").grid(row=3, column=0, sticky="w", pady=(6, 0))
         self.var_attach = tk.StringVar()
-        ttk.Entry(target, textvariable=self.var_attach).grid(
-            row=3, column=1, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Label(target, text="进程映像名，如 msedge.exe, chrome.exe（可填多个）",
+        entry_attach = ttk.Entry(target, textvariable=self.var_attach)
+        entry_attach.grid(row=3, column=1, sticky="ew", pady=(6, 0))
+        entry_attach.bind("<Return>", lambda _e: self.on_add_name())
+        ttk.Button(target, text="添加名称", command=self.on_add_name,
+                   width=10).grid(row=3, column=2, padx=(0, 0), pady=(6, 0))
+        ttk.Label(target, text="进程映像名，如 msedge.exe（可填多个，加入上方列表）",
                   foreground="#666666").grid(row=3, column=3, sticky="w", padx=(6, 0),
                                              pady=(6, 0))
 
@@ -1047,18 +1084,70 @@ class App(ttk.Frame):
 
     # -- 目标列表 ----------------------------------------------------------
 
+    def _target_label(self, kind: str, value: str) -> str:
+        return f"[文件] {value}" if kind == "app" else f"[名称] {value}"
+
+    def _refresh_target_box(self) -> None:
+        self.targets_box.delete(0, "end")
+        for kind, value in self.targets:
+            self.targets_box.insert("end", self._target_label(kind, value))
+
     def _add_target(self, path: str) -> None:
         """Add one executable to the list, ignoring duplicates."""
         path = path.strip().strip('"')
         if not path:
             return
-        if path in self.targets:
+        key = os.path.normcase(os.path.abspath(path))
+        if any(k == "app" and os.path.normcase(os.path.abspath(v)) == key
+               for k, v in self.targets):
             self._show_hint("这个程序已经在列表里了")
         else:
-            self.targets.append(path)
-            self.targets_box.insert("end", path)
-            self._show_hint(f"已添加 {Path(path).name}（共 {len(self.targets)} 个）")
+            self.targets.append(("app", path))
+            self._refresh_target_box()
+            self._show_hint(f"已添加 {Path(path).name}（共 {len(self.targets)} 个目标）")
         self.var_app.set("")
+
+    def _add_watch_names(self, text: str) -> int:
+        """Add image names to the same target list. Returns how many were new."""
+        if "\\" in text or "/" in text:
+            self._show_hint(
+                "“按名称监视”只接受进程映像名；可执行文件请用上方的“浏览…”添加",
+                error=True)
+            return 0
+        added = 0
+        for name in parse_process_names(text):
+            if any(k == "name" and v.lower() == name.lower() for k, v in self.targets):
+                continue
+            self.targets.append(("name", name))
+            added += 1
+        if added:
+            self._refresh_target_box()
+            self._show_hint(f"已按名称添加 {added} 个（共 {len(self.targets)} 个目标）")
+        elif text.strip():
+            self._show_hint("这些名称已经在列表里了")
+        return added
+
+    def on_add_name(self) -> None:
+        text = self.var_attach.get().strip()
+        if not text:
+            self._show_hint("先填写进程映像名，如 msedge.exe", error=True)
+            return
+        if self._add_watch_names(text):
+            self.var_attach.set("")
+
+    def _on_targets_right_click(self, event: "tk.Event") -> None:
+        menu = getattr(self, "_targets_menu", None)
+        if menu is None:
+            return
+        row = self.targets_box.nearest(event.y)
+        if row >= 0 and self.targets_box.size():
+            if row not in self.targets_box.curselection():
+                self.targets_box.selection_clear(0, "end")
+                self.targets_box.selection_set(row)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
 
     def on_add_target(self) -> None:
         path = self.var_app.get().strip().strip('"')
@@ -1071,14 +1160,22 @@ class App(ttk.Frame):
         self._add_target(path)
 
     def on_remove_target(self) -> None:
-        selection = list(self.targets_box.curselection())
-        for index in reversed(selection):
-            self.targets_box.delete(index)
-            del self.targets[index]
+        selection = sorted(self.targets_box.curselection(), reverse=True)
+        if not selection:
+            self._show_hint("先在列表里选中要移除的目标（右键可打开菜单）", error=True)
+            return
+        for index in selection:
+            if 0 <= index < len(self.targets):
+                del self.targets[index]
+        self._refresh_target_box()
+        self._show_hint(f"已移除 {len(selection)} 个，还剩 {len(self.targets)} 个目标")
 
     def on_clear_targets(self) -> None:
-        self.targets_box.delete(0, "end")
+        if not self.targets:
+            return
         self.targets.clear()
+        self._refresh_target_box()
+        self._show_hint("目标列表已清空")
 
     def on_start(self) -> None:
         if self._starting:
@@ -1090,10 +1187,14 @@ class App(ttk.Frame):
                 messagebox.showerror(APP_TITLE, f"找不到文件：\n{pending}")
                 return
             self._add_target(pending)
-        apps = list(self.targets)
-        attaches = parse_process_names(self.var_attach.get())
+        # 名称栏里还没点“添加名称”的，开始监控时也一并采用，省一次点击。
+        if self.var_attach.get().strip():
+            self._add_watch_names(self.var_attach.get())
+            self.var_attach.set("")
+        apps = [value for kind, value in self.targets if kind == "app"]
+        attaches = [value for kind, value in self.targets if kind == "name"]
         if not apps and not attaches:
-            self._show_hint("请先添加要监控的程序，或填写要监视的进程名", error=True)
+            self._show_hint("请先添加要监控的程序，或添加要监视的进程名", error=True)
             self.on_browse()
             return
         for app_path in apps:
@@ -1636,11 +1737,13 @@ class App(ttk.Frame):
     # -- hosts ---------------------------------------------------------------
 
     def on_hosts(self) -> None:
-        """Write the selected process's domain table into the hosts file.
+        """Write the selected processes' domain tables into the hosts file.
 
-        Only one process at a time, and never automatically: what goes into a
-        hosts file changes how the whole machine resolves names, so it is the
-        user's call and it should show what it is about to do first.
+        Several processes can be chosen at once; their plans are merged, so a
+        domain both resolved becomes one line with both owners. Writing is
+        never automatic until the user ticks the box: what goes into a hosts
+        file changes how the whole machine resolves names, so it should show
+        what it is about to do first.
         """
         if self._hosts_win is not None and self._hosts_win.winfo_exists():
             self._hosts_win.lift()
@@ -1661,31 +1764,35 @@ class App(ttk.Frame):
         tab1 = ttk.Frame(nb, padding=8)
         nb.add(tab1, text=" 写入 ")
 
-        head = ttk.LabelFrame(tab1, text=" 要写入哪些进程的域名表（可多选） ", padding=8)
+        head = ttk.LabelFrame(tab1, text=" 要写入哪些进程的域名表（右键选择，可多选） ", padding=8)
         head.pack(fill="x")
         ttk.Label(head, text="进程：").grid(row=0, column=0, sticky="nw")
         proc_frame = ttk.Frame(head)
         proc_frame.grid(row=0, column=1, sticky="w", padx=(0, 16))
         self._hosts_proc_list = tk.Listbox(
-            proc_frame, height=4, width=34, exportselection=False,
-            selectmode="extended", font=("Consolas", 10), activestyle="none",
+            proc_frame, height=5, width=40, exportselection=False,
+            selectmode="browse", font=("Consolas", 10), activestyle="none",
+            selectbackground="#e6f4ec", selectforeground="#0a6b3d",
         )
         self._hosts_proc_list.grid(row=0, column=0, sticky="w")
         sb_proc = ttk.Scrollbar(proc_frame, orient="vertical",
                                 command=self._hosts_proc_list.yview)
         sb_proc.grid(row=0, column=1, sticky="ns")
         self._hosts_proc_list.configure(yscrollcommand=sb_proc.set)
-        # Selecting processes is enough: the preview follows the selection,
-        # because there is no separate "refresh" gesture any more. Ctrl/Shift
-        # selects several, and their plans are merged into one table.
-        self._hosts_proc_list.bind("<<ListboxSelect>>",
-                                   lambda _e: self._refresh_hosts_preview())
+        # The set of processes that will be written is the set of green rows,
+        # not the highlight bar: right-click adds or removes one, and the
+        # preview follows immediately. Left-click only moves the cursor.
+        self._hosts_proc_list.bind("<Button-3>", self._on_hosts_proc_right_click)
+        self._hosts_proc_list.bind("<Double-Button-1>",
+                                   lambda _e: self._toggle_hosts_process_at_cursor())
+        self._hosts_proc_hint = ttk.Label(head, text="", foreground="#666666")
+        self._hosts_proc_hint.grid(row=1, column=1, sticky="w", pady=(4, 0))
         ttk.Button(head, text="刷新进程列表", command=self._fill_hosts_processes,
                    width=14).grid(row=0, column=2, sticky="n")
 
-        ttk.Label(head, text="无 IPv6 的域名：").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(head, text="无 IPv6 的域名：").grid(row=2, column=0, sticky="w", pady=(8, 0))
         pol = ttk.Frame(head)
-        pol.grid(row=1, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        pol.grid(row=2, column=1, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Radiobutton(pol, text="指向 127.0.0.1（禁用该域名）",
                         variable=self._hosts_policy,
                         value="block", command=self._on_policy_change
@@ -1695,17 +1802,18 @@ class App(ttk.Frame):
                         value="skip", command=self._on_policy_change
                         ).pack(side="left", padx=(14, 0))
 
-        auto = ttk.LabelFrame(tab1, text=" 自动模式 ", padding=8)
+        auto = ttk.LabelFrame(tab1, text=" 自动模式（可多进程，同名域名合并为一行） ", padding=8)
         auto.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(
             auto,
-            text="开启后，上方所选进程的域名表一有变化就自动写入 hosts",
+            text="开启后，上方已选进程的域名表一有变化就自动写入 hosts",
             variable=self._hosts_auto, command=self.on_hosts_auto_toggle,
         ).pack(anchor="w")
         ttk.Label(
             auto,
-            text=("会在 AAAA 查询全部落定、且计划稳定 1.5 秒后才写入，避免把还没查到"
-                  "IPv6 的域名先写成 127.0.0.1。自动模式只写入、不删除条目。"),
+            text=("会在所有进程的 AAAA 查询全部落定、且计划稳定 1.5 秒后才写入，避免把还没查到"
+                  "IPv6 的域名先写成 127.0.0.1。两个进程写入同一条域名时合并为一行，"
+                  "并记录两个归属；自动模式只写入、不删除条目。"),
             foreground="#666666", wraplength=900,
         ).pack(anchor="w", pady=(2, 0))
 
@@ -1849,6 +1957,7 @@ class App(ttk.Frame):
         self._hosts_status = None
         self._hosts_info = None
         self._hosts_proc_list = None
+        self._hosts_proc_hint = None
         self._hosts_entries_tree = None
         self._hosts_entries_info = None
         self._hosts_menu = None
@@ -1858,12 +1967,36 @@ class App(ttk.Frame):
         self._hosts_preview_by_process.clear()
 
     def _selected_hosts_processes(self) -> list[str]:
-        """The processes currently selected in the picker, in list order."""
+        """The processes currently chosen, in list order."""
+        known = set(self._hosts_procs)
+        return [name for name in self._hosts_chosen if name in known]
+
+    def _sync_hosts_processes(self) -> None:
+        """Paint chosen rows green and say how many there are."""
         lb = getattr(self, "_hosts_proc_list", None)
         if lb is None or not lb.winfo_exists():
-            return []
-        return [self._hosts_procs[i] for i in lb.curselection()
-                if 0 <= i < len(self._hosts_procs)]
+            return
+        chosen = set(self._hosts_chosen)
+        for index, name in enumerate(self._hosts_procs):
+            on = name in chosen
+            # The cursor highlight uses a light green background, so a chosen
+            # row stays readable whether or not it is the focused one.
+            lb.itemconfig(
+                index,
+                foreground="#0a7d3d" if on else "#333333",
+                selectforeground="#0a6b3d" if on else "#000000",
+            )
+        hint = getattr(self, "_hosts_proc_hint", None)
+        if hint is not None and hint.winfo_exists():
+            if chosen:
+                shown = "、".join(self._hosts_chosen[:4])
+                more = f" 等 {len(self._hosts_chosen)} 个" if len(self._hosts_chosen) > 4 else ""
+                hint.configure(
+                    text=f"已选 {len(self._hosts_chosen)} 个（绿色）：{shown}{more}",
+                    foreground="#0a6b3d")
+            else:
+                hint.configure(text="右键点进程名选择要写入的进程（可多选）",
+                               foreground="#666666")
 
     def _fill_hosts_processes(self) -> None:
         # Everything with a domain table -- including the previous session's,
@@ -1873,18 +2006,21 @@ class App(ttk.Frame):
         lb = getattr(self, "_hosts_proc_list", None)
         if lb is None or not lb.winfo_exists():
             return
-        keep = set(self._selected_hosts_processes())
+        keep = [name for name in self._hosts_chosen if name in names]
         self._hosts_procs = names
         lb.delete(0, "end")
         for name in names:
             lb.insert("end", name)
-        chosen = [i for i, name in enumerate(names) if name in keep]
-        if not chosen and names:
-            # Nothing selected yet (first open, or the selection vanished):
-            # default to the first process so the table is not empty.
-            chosen = [0]
-        for index in chosen:
+        if not keep and names and not self._hosts_choice_made:
+            # Nothing chosen yet (first open): default to the first process so
+            # the table is not empty. A deliberate "选择全不选" is respected.
+            keep = [names[0]]
+        self._hosts_chosen = keep
+        if self._hosts_chosen:
+            index = names.index(self._hosts_chosen[0])
+            lb.selection_clear(0, "end")
             lb.selection_set(index)
+        self._sync_hosts_processes()
         # A process that vanished from the list can no longer be written to;
         # drop its cached plan instead of showing rows whose commands would
         # name a process the engine does not know.
@@ -1894,6 +2030,77 @@ class App(ttk.Frame):
         }
         self._rebuild_hosts_preview(self._selected_hosts_processes())
         self._render_hosts_preview()
+
+    def _toggle_hosts_process(self, name: str) -> None:
+        self._hosts_choice_made = True
+        if name in self._hosts_chosen:
+            self._hosts_chosen.remove(name)
+            note = f"已取消选择 {name}"
+        else:
+            self._hosts_chosen.append(name)
+            # Keep the chosen list in the order the picker shows, so the
+            # preview rows do not jump around as processes are added.
+            order = {n: i for i, n in enumerate(self._hosts_procs)}
+            self._hosts_chosen.sort(key=lambda n: order.get(n, 0))
+            note = f"已选择 {name}"
+        self._sync_hosts_processes()
+        self._refresh_hosts_preview()
+        self._set_hosts_status(note, ok=True)
+        # Automatic mode follows the set, otherwise it would keep writing the
+        # processes that were chosen when it was switched on.
+        if self._hosts_auto.get():
+            self.on_hosts_auto_toggle()
+
+    def _toggle_hosts_process_at_cursor(self) -> None:
+        lb = getattr(self, "_hosts_proc_list", None)
+        if lb is None or not lb.winfo_exists():
+            return
+        selection = lb.curselection()
+        if selection and selection[0] < len(self._hosts_procs):
+            self._toggle_hosts_process(self._hosts_procs[selection[0]])
+
+    def _on_hosts_proc_right_click(self, event: "tk.Event") -> None:
+        lb = getattr(self, "_hosts_proc_list", None)
+        if lb is None or not lb.winfo_exists():
+            return
+        index = lb.nearest(event.y)
+        if index < 0 or index >= len(self._hosts_procs):
+            return
+        lb.selection_clear(0, "end")
+        lb.selection_set(index)
+        lb.activate(index)
+        name = self._hosts_procs[index]
+        menu = tk.Menu(lb, tearoff=0)
+        chosen = name in self._hosts_chosen
+        menu.add_command(
+            label=("取消选择该进程" if chosen else "选择该进程"),
+            command=lambda n=name: self._toggle_hosts_process(n))
+        menu.add_separator()
+        menu.add_command(label=f"全选（{len(self._hosts_procs)} 个）",
+                         command=self._select_all_hosts_processes)
+        menu.add_command(label="全不选", command=self._clear_hosts_processes)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+            menu.destroy()
+
+    def _select_all_hosts_processes(self) -> None:
+        self._hosts_choice_made = True
+        self._hosts_chosen = list(self._hosts_procs)
+        self._sync_hosts_processes()
+        self._refresh_hosts_preview()
+        if self._hosts_auto.get():
+            self.on_hosts_auto_toggle()
+
+    def _clear_hosts_processes(self) -> None:
+        self._hosts_choice_made = True
+        self._hosts_chosen.clear()
+        self._sync_hosts_processes()
+        self._set_hosts_status(
+            "已清空选择。右键点进程名重新选择要写入的进程。", ok=False)
+        if self._hosts_auto.get():
+            self.on_hosts_auto_toggle()
 
     def _on_policy_change(self) -> None:
         """Refresh the preview, and keep automatic mode on the same policy."""
@@ -2146,30 +2353,23 @@ class App(ttk.Frame):
     def on_hosts_auto_toggle(self) -> None:
         on = self._hosts_auto.get()
         processes = self._selected_hosts_processes()
-        if on and len(processes) != 1:
-            # Automatic writing follows one process's table; several at once
-            # would have no single "the table changed" signal to wait on.
+        if on and not processes:
             self._hosts_auto.set(False)
             self.send_command({"cmd": "hosts_auto", "on": False})
             self._set_hosts_status(
-                "自动模式一次只针对一个进程：请只选中一个进程", ok=False)
-            return
-        if not processes:
-            self._hosts_auto.set(False)
-            self.send_command({"cmd": "hosts_auto", "on": False})
-            self._set_hosts_status("请先选择进程，再开启自动模式", ok=False)
+                "请先右键选择至少一个进程，再开启自动模式", ok=False)
             return
         self.send_command({
             "cmd": "hosts_auto",
             "on": on,
-            "process": processes[0],
+            "processes": processes,
             "policy": self._hosts_policy.get(),
         })
 
     def on_hosts_write(self) -> None:
         processes = self._selected_hosts_processes()
         if not processes:
-            self._set_hosts_status("请先选择进程", ok=False)
+            self._set_hosts_status("请先右键选择进程", ok=False)
             return
         policy = self._hosts_policy.get()
         what = ("指向 127.0.0.1" if policy == "block" else "不写入")
@@ -2180,15 +2380,15 @@ class App(ttk.Frame):
             f"{names}\n\n"
             "· 已经写过的域名不动，也不会重复写入；\n"
             "· 没有写过的域名追加到本程序标记的区块里；\n"
+            "· 两个进程写入同一条域名时合并为一行，记录两个归属；\n"
             "· 之前因查不到 IPv6 而指向 127.0.0.1 的域名，现在有 IPv6 了会更新为 IPv6 地址；\n"
             "· 其它进程写入的条目、以及文件里的其它内容，一律不动；\n"
-            "· 每个进程各写一次，每个进程写入前都会自动备份；\n"
-            f"· 没有新的域名可写时，什么都不写。\n\n"
+            "· 所有进程合并成一次写入，写入前自动备份一次。\n\n"
             f"无 IPv6 的域名：{what}。",
         ):
             return
-        for proc in processes:
-            self.send_command({"cmd": "hosts_write", "process": proc, "policy": policy})
+        self.send_command({
+            "cmd": "hosts_write", "processes": processes, "policy": policy})
 
     def _on_hosts_preview_right_click(self, event: "tk.Event") -> None:
         """Right-click: keep the selection if the click lands inside it.
@@ -2236,9 +2436,9 @@ class App(ttk.Frame):
         """Write only the rows selected in the preview.
 
         The selection decides which domains are planned, and may span several
-        processes: each process gets its own write, so the owner markers stay
-        correct and each file change has its own backup. The policy and every
-        write rule are unchanged.
+        processes: the engine folds them into one write, so a name both
+        processes resolved becomes one shared line with one backup. The policy
+        and every write rule are unchanged.
         """
         keys = self._selected_hosts_keys()
         if not keys:
@@ -2256,16 +2456,18 @@ class App(ttk.Frame):
             APP_TITLE,
             f"只把选中的 {len(keys)} 行写入 hosts？\n\n{summary}\n\n"
             "· 已写入的域名不动，没有写过的追加到本程序标记的区块里；\n"
+            "· 同名域名由多个进程选中时合并为一行，记录所有归属；\n"
             "· 其它域名保持原样，不会因为这次写入而发生变化；\n"
             f"· 选中的域名若没有可用 IPv6：{what}。\n"
-            "每个进程写入前会自动备份。",
+            "写入前会自动备份一次。",
         ):
             return
-        for proc, domains in groups.items():
-            self.send_command({
-                "cmd": "hosts_write", "process": proc,
-                "policy": policy, "domains": domains,
-            })
+        self.send_command({
+            "cmd": "hosts_write",
+            "processes": list(groups),
+            "policy": policy,
+            "domains": [domain for _proc, domain in keys],
+        })
 
     def on_hosts_copy_selected(self) -> None:
         keys = self._selected_hosts_keys()
@@ -2523,8 +2725,129 @@ def parse_cli(argv: list[str]) -> dict[str, Any]:
     return out
 
 
+def wpcap_available() -> bool:
+    """Whether Npcap's wpcap.dll can be loaded.
+
+    netmon.exe links against it at load time, so without it the engine cannot
+    start at all -- this is a prerequisite, not an optional feature.
+    """
+    try:
+        ctypes.WinDLL("wpcap.dll")
+        return True
+    except OSError:
+        return False
+
+
+def bundled_npcap_installer() -> Optional[Path]:
+    """The Npcap installer shipped inside a one-file build, if there is one."""
+    roots = [frozen_bundle_dir(), app_dir() / "deps", app_dir() / "tools"]
+    for root in roots:
+        if root is None:
+            continue
+        found = sorted(root.glob("npcap-*.exe"))
+        if found:
+            return found[0]
+    return None
+
+
+def install_npcap(installer: Path) -> bool:
+    """Run the bundled installer elevated and wait for it. Returns success."""
+    script = (
+        f"$p = Start-Process -FilePath '{installer}' "
+        "-ArgumentList '/S','/winpcap_mode=yes','/loopback_support=yes' "
+        "-Verb RunAs -Wait -PassThru; exit $p.ExitCode"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
+            timeout=300, check=False,
+        )
+    except Exception:
+        return False
+    return wpcap_available()
+
+
+def ensure_npcap(root: tk.Tk) -> bool:
+    """Explain and, when possible, install the missing driver."""
+    if wpcap_available():
+        return True
+    installer = bundled_npcap_installer()
+    if installer is not None and messagebox.askyesno(
+        APP_TITLE,
+        "NetMonitor 的抓包引擎需要 Npcap 驱动，但这台机器上还没有安装。\n\n"
+        "发布包里已经带了安装程序，现在安装吗？（需要管理员权限，"
+        "安装的是 Npcap 官方的网络驱动）\n\n"
+        "选择「否」仍然可以打开界面，但开始监控会失败。",
+    ):
+        root.withdraw()
+        ok = install_npcap(installer)
+        root.deiconify()
+        if ok:
+            messagebox.showinfo(APP_TITLE, "Npcap 已安装，可以开始监控了。")
+            return True
+        messagebox.showwarning(
+            APP_TITLE,
+            "Npcap 没有安装成功。\n\n"
+            "可以手动运行发布包里的 install-npcap.cmd，或从 https://npcap.com 下载安装。")
+        return False
+    if installer is None:
+        messagebox.showwarning(
+            APP_TITLE,
+            "找不到 Npcap（wpcap.dll），抓包引擎无法启动。\n\n"
+            "请先安装 Npcap：https://npcap.com\n"
+            "图形界面仍会打开，但开始监控会失败。")
+    return False
+
+
+def run_selftest(out: Path) -> int:
+    """Headless check used by the packaging script to verify a one-file build."""
+    engine = find_engine()
+    info = {
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "executable": sys.executable,
+        "bundle": str(frozen_bundle_dir() or ""),
+        "engine": str(engine) if engine else None,
+        "engine_exists": bool(engine and engine.is_file()),
+        "wpcap": wpcap_available(),
+        "npcap_installer": (lambda p: str(p) if p else None)(bundled_npcap_installer()),
+        "tk": tk.TkVersion,
+        "python": sys.version,
+    }
+    out.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0 if info["engine_exists"] else 2
+
+
+def prepare_frozen_dirs() -> None:
+    """One-file builds: keep runtime data next to the exe, not in the temp dir.
+
+    The engine's defaults are relative to its own executable, and in a one-file
+    build that is a temporary extraction folder that disappears on exit. Setting
+    these explicitly is what makes the records and hosts backups survive a
+    restart. If the exe sits somewhere read-only, fall back to LocalAppData.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    root = app_dir()
+    try:
+        (root / "netmon-data").mkdir(exist_ok=True)
+        probe = root / ".netmon-write-test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError:
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "NetMonitor"
+        root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NETMON_DATA_DIR", str(root / "netmon-data"))
+    os.environ.setdefault("NETMON_HOSTS_BACKUP_DIR", str(root / "hosts-backups"))
+
+
 def main() -> int:
-    opts = parse_cli(sys.argv[1:])
+    argv = sys.argv[1:]
+    if "--selftest" in argv:
+        i = argv.index("--selftest")
+        out = Path(argv[i + 1]) if i + 1 < len(argv) else Path("netmon-selftest.json")
+        return run_selftest(out)
+    prepare_frozen_dirs()
+    opts = parse_cli(argv)
     root = tk.Tk()
     root.title(APP_TITLE)
     root.geometry("1280x760")
@@ -2534,11 +2857,15 @@ def main() -> int:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    # Npcap is a hard prerequisite for the engine, so say so before the window
+    # is shown -- and install the copy the one-file build carries, if the user
+    # agrees.
+    ensure_npcap(root)
     app = App(root)
     if opts["app"]:
         app._add_target(opts["app"])
     if opts["attach"]:
-        app.var_attach.set(opts["attach"])
+        app._add_watch_names(opts["attach"])
     if opts["args"]:
         app.var_args.set(opts["args"])
     if opts["auto"]:
@@ -2549,4 +2876,30 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        # A windowed build has no console: without this, a startup failure is
+        # a window that never appears and nothing to read. Leave the traceback
+        # somewhere findable and say where it is.
+        import traceback
+
+        text = traceback.format_exc()
+        log = None
+        for candidate in (Path(os.environ.get("TEMP", ".")), app_dir()):
+            try:
+                log = candidate / "NetMonitor-crash.log"
+                log.write_text(text, encoding="utf-8")
+                break
+            except OSError:
+                continue
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                f"NetMonitor 启动失败：\n\n{text[-1200:]}\n\n日志：{log}",
+                APP_TITLE, 0x10)
+        except Exception:
+            pass
+        raise

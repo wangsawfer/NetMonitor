@@ -1,6 +1,8 @@
 # Build toolchain and caches: machine-local, large, and never part of a source tree.
 .toolchain/
 .cache/
+# Local Python environment used only to build the one-file exe (PyInstaller).
+.toolenv/
 
 # Runtime data written beside the executable: per-machine history, not source.
 netmon-data/
@@ -8,6 +10,9 @@ hosts-backups/
 
 # Packaging residue: the staged folder is rebuilt by scripts/package.ps1.
 dist/NetMonitor-*-win64/
+dist/*.zip
+dist/*.exe
+dist/LICENSE.txt
 
 # Python bytecode from running the GUI.
 __pycache__/

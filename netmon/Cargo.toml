@@ -1,6 +1,6 @@
 [package]
 name = "netmon"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "Event-driven Windows network (DNS) monitor for a target application tree"
 authors = ["NetMonitor"]
