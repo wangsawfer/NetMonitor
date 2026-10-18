@@ -72,6 +72,12 @@ if (-not $python) {
     throw "Python 3 was not found on PATH; install it first"
 }
 $localSite = Join-Path $ProjectRoot '.toolenv\site-packages'
+# Keep pip's download cache and PyInstaller's own cache inside the project too:
+# the brief is that the build tooling lives in this folder, not in the user
+# profile or on the system drive.
+$env:PIP_CACHE_DIR = Join-Path $ProjectRoot '.toolenv\pip-cache'
+$env:PYINSTALLER_CONFIG_DIR = Join-Path $ProjectRoot '.cache\pyinstaller\config'
+New-Item -ItemType Directory -Force -Path $env:PIP_CACHE_DIR, $env:PYINSTALLER_CONFIG_DIR | Out-Null
 if (-not (Test-Path (Join-Path $localSite 'PyInstaller'))) {
     Write-Host "==> installing PyInstaller into .toolenv\site-packages" -ForegroundColor Cyan
     New-Item -ItemType Directory -Force -Path $localSite | Out-Null
