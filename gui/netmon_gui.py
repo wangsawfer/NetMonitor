@@ -1920,7 +1920,7 @@ class App(ttk.Frame):
         self._hosts_entries_info.pack(side="left", padx=12)
         ttk.Label(
             bar3,
-            text="本程序管理的区块；Ctrl/Shift 多选，右键复制或删除；共用行在两个进程下各出现一次",
+            text="Ctrl/Shift 多选，右键复制 / 删除",
             foreground="#666666",
         ).pack(side="right")
         # The tree column carries the process; the two data columns are the
