@@ -57,6 +57,9 @@ pub struct SavedProcess {
     pub first_seen_ms: i64,
     #[serde(default)]
     pub last_seen_ms: i64,
+    /// Created by the user in the table editor rather than observed live.
+    #[serde(default)]
+    pub manual: bool,
     pub domains: Vec<SavedDomain>,
 }
 
@@ -283,6 +286,7 @@ mod tests {
                 pid: 42,
                 first_seen_ms: 1,
                 last_seen_ms: 2,
+                manual: false,
                 domains: vec![SavedDomain {
                     domain: "www.example.com".into(),
                     answer: "found".into(),

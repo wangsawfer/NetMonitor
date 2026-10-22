@@ -463,7 +463,7 @@ fn headless(cli: &Cli) -> ExitCode {
                         // file, so the window can say "已写入" without a second
                         // round trip.
                         let annotated = session.hosts_preview_annotated(&process, policy);
-                        emit_json(&hosts_preview_json(&process, policy, &annotated));
+                        emit_json(&hosts_preview_json(&process, policy, &annotated, &session));
                     }
                     crate::app::EngineCommand::HostsWrite {
                         processes,
@@ -602,6 +602,54 @@ fn headless(cli: &Cli) -> ExitCode {
                             "note": format!("备份失败：{e}"),
                         })),
                     },
+                    crate::app::EngineCommand::DomainsEdit {
+                        process,
+                        add,
+                        remove,
+                        remove_process,
+                    } => {
+                        let before = session.domains.rows_for(&process).len();
+                        let (added, removed, deleted, saved) = if remove_process {
+                            let ok = session.domains.remove_process(&process);
+                            (0, before, ok, session.save_domain_cache_now().is_some())
+                        } else {
+                            let empty_add = add.is_empty();
+                            let removed = session.domains.remove_domains(&process, &remove);
+                            let added = session.domains.add_domains(&process, &add);
+                            if empty_add && remove.is_empty() {
+                                session.domains.add_process(&process);
+                            }
+                            let saved = session.save_domain_cache_now().is_some();
+                            (added, removed, false, saved)
+                        };
+                        let note = if deleted {
+                            format!("已删除进程 {process} 及其 {removed} 个域名")
+                        } else if added > 0 && removed > 0 {
+                            format!("{process}：添加 {added} 个、删除 {removed} 个域名")
+                        } else if added > 0 {
+                            format!("{process}：已添加 {added} 个域名")
+                        } else if removed > 0 {
+                            format!("{process}：已删除 {removed} 个域名")
+                        } else {
+                            format!("{process}：域名表没有变化")
+                        };
+                        let note = if saved {
+                            format!("{note}（已写入缓存）")
+                        } else {
+                            note
+                        };
+                        emit_json(&serde_json::json!({
+                            "type": "domains_edited",
+                            "ok": true,
+                            "process": process,
+                            "added": added,
+                            "removed": removed,
+                            "removed_process": deleted,
+                            "saved": saved,
+                            "note": note,
+                        }));
+                        emit_domain_tables(json, &session);
+                    }
                     crate::app::EngineCommand::HostsAuto { on, processes, policy } => {
                         session.hosts_auto.policy = policy;
                         session.set_hosts_auto(on, Some(processes));
@@ -802,10 +850,16 @@ fn hosts_preview_json(
     process: &str,
     policy: crate::hosts::NoAaaaPolicy,
     entries: &[(crate::hosts::PlannedEntry, crate::hosts::RowPlan)],
+    session: &Session,
 ) -> serde_json::Value {
     let rows: Vec<serde_json::Value> = entries
         .iter()
         .map(|(e, row)| {
+            let table = session.domains.lookup(&e.domain);
+            let recorded: Vec<String> = table
+                .as_ref()
+                .map(|t| t.addresses().iter().map(|a| a.to_string()).collect())
+                .unwrap_or_default();
             serde_json::json!({
                 "domain": e.domain,
                 "address": e.address,
@@ -816,6 +870,13 @@ fn hosts_preview_json(
                 "needs_write": row.action.changes_file(),
                 // The address is the previous session's, not a fresh lookup.
                 "previous": e.previous_session,
+                // The row from the domain table itself: every AAAA answer the
+                // table holds for this name, plus its lookup state. The preview
+                // lists the whole table, not only the rows a write would change.
+                "table_status": table.as_ref().map(|t| t.status()).unwrap_or_default(),
+                "recorded": recorded,
+                "settled": table.as_ref().map(|t| t.settled()).unwrap_or(false),
+                "archived": table.as_ref().map(|t| t.archived).unwrap_or(false),
             })
         })
         .collect();
@@ -842,6 +903,7 @@ fn hosts_outcome_json(
         "backup": o.backup.as_ref().map(|b| b.display().to_string()),
         "appended": o.appended,
         "upgraded": o.upgraded,
+        "replaced": o.replaced,
         "claimed": o.claimed,
         "kept": o.kept,
         "skipped": o.skipped,

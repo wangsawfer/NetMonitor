@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, bounded};
 
@@ -767,6 +767,9 @@ pub struct HostsOutcome {
     pub appended: usize,
     /// Lines whose block address became a real IPv6 address.
     pub upgraded: usize,
+    /// Lines whose previous address failed the usability probe and were
+    /// replaced by the freshly resolved one.
+    pub replaced: usize,
     /// Lines that gained this process's name.
     pub claimed: usize,
     /// Rows already exactly right, left untouched.
@@ -824,6 +827,9 @@ fn write_note(m: &crate::hosts::Merge) -> String {
     if m.upgraded > 0 {
         parts.push(format!("{} 条由 127.0.0.1 更新为 IPv6", m.upgraded));
     }
+    if m.replaced > 0 {
+        parts.push(format!("{} 条旧地址不可用，已替换", m.replaced));
+    }
     if m.claimed > 0 {
         parts.push(format!("{} 条登记到本进程", m.claimed));
     }
@@ -838,6 +844,71 @@ fn write_note(m: &crate::hosts::Merge) -> String {
     } else {
         parts.join("，")
     }
+}
+
+/// Ports a written address is probed on, in order. A hosts entry is usually a
+/// web name; 443 first, then 80, so a name that serves only plain HTTP is not
+/// declared dead.
+const PROBE_PORTS: [u16; 2] = [443, 80];
+/// Short enough to keep one write responsive, long enough for a working host.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
+/// Probing is network I/O, so several addresses are checked in parallel.
+const PROBE_WORKERS: usize = 8;
+
+/// Does this address accept a TCP connection on one of the probe ports?
+fn probe_ipv6(addr: std::net::Ipv6Addr) -> bool {
+    use std::net::{SocketAddr, SocketAddrV6, TcpStream};
+    let scope = 0;
+    for port in PROBE_PORTS {
+        let sa = SocketAddr::V6(SocketAddrV6::new(addr, port, 0, scope));
+        if TcpStream::connect_timeout(&sa, PROBE_TIMEOUT).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Which of these addresses answer, checked with a few worker threads.
+fn answering_ipv6(addrs: &[std::net::Ipv6Addr]) -> HashSet<std::net::Ipv6Addr> {
+    let unique: Vec<std::net::Ipv6Addr> = {
+        let mut seen = HashSet::new();
+        addrs.iter().copied().filter(|a| seen.insert(*a)).collect()
+    };
+    if unique.is_empty() {
+        return HashSet::new();
+    }
+    let queue = Mutex::new(unique);
+    let good: Mutex<HashSet<std::net::Ipv6Addr>> = Mutex::new(HashSet::new());
+    std::thread::scope(|scope| {
+        for _ in 0..PROBE_WORKERS {
+            scope.spawn(|| loop {
+                let addr = queue.lock().ok().and_then(|mut q| q.pop());
+                let Some(addr) = addr else { break };
+                if probe_ipv6(addr) {
+                    if let Ok(mut g) = good.lock() {
+                        g.insert(addr);
+                    }
+                }
+            });
+        }
+    });
+    good.into_inner().unwrap_or_default()
+}
+
+/// For each candidate `(domain, address already in the block)`, decide whether
+/// that address failed to answer. Only candidates with a *different* fresh IPv6
+/// address are passed in; equal addresses need no decision.
+fn unanswering_domains(candidates: &[(String, std::net::Ipv6Addr)]) -> HashSet<String> {
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+    let addrs: Vec<std::net::Ipv6Addr> = candidates.iter().map(|(_, a)| *a).collect();
+    let answering = answering_ipv6(&addrs);
+    candidates
+        .iter()
+        .filter(|(_, a)| !answering.contains(a))
+        .map(|(d, _)| d.to_ascii_lowercase())
+        .collect()
 }
 
 impl Session {
@@ -900,10 +971,10 @@ impl Session {
     /// Fold one process's domain table into the managed block.
     ///
     /// Additive by construction: [`crate::hosts::merge`] only ever adds a line,
-    /// corrects a blocked line that now has an IPv6 answer, or records this
-    /// process on a line another process already wrote. Nothing is removed and
-    /// nothing already written has its address changed, so a write can never
-    /// take away what an earlier one put there. Clearing is a separate action
+    /// corrects a blocked line that now has an IPv6 answer, replaces an address
+    /// that a probe found dead, or records this process on a line another
+    /// process already wrote. Nothing is removed, so a write can never take
+    /// away what an earlier one put there. Clearing is a separate action
     /// (`hosts_remove`) with its own confirmation.
     pub fn hosts_write(
         &mut self,
@@ -929,6 +1000,95 @@ impl Session {
         self.hosts_write_impl(process, policy, Some(domains))
     }
 
+    /// Mark rows whose *existing* block address no longer answers.
+    ///
+    /// Only a different, real IPv6 address is worth probing: an equal address is
+    /// already right, and the loopback block address has its own upgrade path.
+    /// The probe runs here rather than in the pure merge code so the decision
+    /// can use the network without making `hosts.rs` depend on it.
+    /// The domains whose existing address has to be probed: a real IPv6 answer
+    /// is planned, the block holds a different IPv6 address, and that old
+    /// address is no longer among the current AAAA answers.
+    fn stale_candidates<'a>(
+        &self,
+        entries: &[crate::hosts::BlockEntry],
+        planned: impl Iterator<Item = &'a PlannedEntry>,
+    ) -> Vec<(String, std::net::Ipv6Addr)> {
+        let mut out = Vec::new();
+        for p in planned {
+            if p.replace_existing || p.reason != crate::hosts::PlanReason::Ipv6 {
+                continue;
+            }
+            let Some(b) = entries
+                .iter()
+                .find(|b| b.domain.eq_ignore_ascii_case(&p.domain))
+            else {
+                continue;
+            };
+            if b.address.eq_ignore_ascii_case(&p.address) {
+                continue;
+            }
+            let (Ok(old), Ok(_new)) = (
+                b.address.parse::<std::net::Ipv6Addr>(),
+                p.address.parse::<std::net::Ipv6Addr>(),
+            ) else {
+                continue;
+            };
+            if old.is_unicast_link_local() {
+                continue;
+            }
+            // If the current AAAA answer still contains the old address, the
+            // name is still being served by it: no probe needed, keep it.
+            let still_recorded = self
+                .domains
+                .lookup(&p.domain)
+                .map(|t| {
+                    t.addresses()
+                        .iter()
+                        .any(|a| a.to_string().eq_ignore_ascii_case(&b.address))
+                })
+                .unwrap_or(false);
+            if still_recorded {
+                continue;
+            }
+            out.push((p.domain.clone(), old));
+        }
+        out
+    }
+
+    fn mark_stale_addresses(&self, file: &crate::hosts::HostsFile, rows: &mut [PlannedEntry]) {
+        let candidates = self.stale_candidates(&file.block_entries(), rows.iter());
+        let stale = unanswering_domains(&candidates);
+        if stale.is_empty() {
+            return;
+        }
+        for p in rows.iter_mut() {
+            if stale.contains(&p.domain.to_ascii_lowercase()) {
+                p.replace_existing = true;
+            }
+        }
+    }
+
+    fn mark_stale_addresses_owned(
+        &self,
+        file: &crate::hosts::HostsFile,
+        rows: &mut [(Vec<String>, PlannedEntry)],
+    ) {
+        let candidates = self.stale_candidates(
+            &file.block_entries(),
+            rows.iter().map(|(_, p)| p),
+        );
+        let stale = unanswering_domains(&candidates);
+        if stale.is_empty() {
+            return;
+        }
+        for (_, p) in rows.iter_mut() {
+            if stale.contains(&p.domain.to_ascii_lowercase()) {
+                p.replace_existing = true;
+            }
+        }
+    }
+
     /// The single-process merge. Multi-process and automatic writes go through
     /// [`Self::write_owned`], which uses the same merge rules but folds several
     /// tables into one file change.
@@ -947,6 +1107,7 @@ impl Session {
             });
         }
         let file = self.load_hosts()?;
+        self.mark_stale_addresses(&file, &mut rows);
         let m = crate::hosts::merge(&file, process, &rows);
         if !m.changed {
             let note = if rows.is_empty() {
@@ -977,6 +1138,7 @@ impl Session {
             backup,
             appended: m.appended,
             upgraded: m.upgraded,
+            replaced: m.replaced,
             claimed: m.claimed,
             kept: m.kept,
             skipped: m.skipped,
@@ -1103,7 +1265,9 @@ impl Session {
         subset: bool,
     ) -> anyhow::Result<HostsOutcome> {
         let file = self.load_hosts()?;
-        let m = crate::hosts::merge_owned(&file, rows);
+        let mut prepared = rows.to_vec();
+        self.mark_stale_addresses_owned(&file, &mut prepared);
+        let m = crate::hosts::merge_owned(&file, &prepared);
         if !m.changed {
             let note = if rows.is_empty() {
                 if subset {
@@ -1138,6 +1302,7 @@ impl Session {
             backup,
             appended: m.appended,
             upgraded: m.upgraded,
+            replaced: m.replaced,
             claimed: m.claimed,
             kept: m.kept,
             skipped: m.skipped,
@@ -1524,7 +1689,9 @@ impl Session {
                 at >= cutoff || pinned.contains(&d.domain.to_ascii_lowercase())
             });
         }
-        snap.processes.retain(|p| !p.domains.is_empty());
+        // An empty table the user created by hand is still worth keeping; a
+        // captured table that lost every row can age out normally.
+        snap.processes.retain(|p| !p.domains.is_empty() || p.manual);
         if snap.processes.is_empty() {
             return None;
         }
@@ -1659,6 +1826,15 @@ pub enum EngineCommand {
         on: bool,
         processes: Vec<String>,
         policy: crate::hosts::NoAaaaPolicy,
+    },
+    /// Edit a process's domain table: add/remove names, or remove the whole
+    /// process. The table is what the hosts preview reads, so an edit is visible
+    /// there immediately.
+    DomainsEdit {
+        process: String,
+        add: Vec<String>,
+        remove: Vec<String>,
+        remove_process: bool,
     },
 }
 
@@ -1833,6 +2009,38 @@ pub fn spawn_command_reader() -> Option<crossbeam_channel::Receiver<EngineComman
                         processes: parse_processes(&v),
                         policy: parse_policy(&v),
                     },
+                    Some("domains_edit") => {
+                        let process = v
+                            .get("process")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        if process.is_empty() {
+                            continue;
+                        }
+                        let list = |key: &str| -> Vec<String> {
+                            v.get(key)
+                                .and_then(|a| a.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|x| x.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        };
+                        EngineCommand::DomainsEdit {
+                            process,
+                            add: list("add"),
+                            remove: list("remove"),
+                            remove_process: v
+                                .get("remove_process")
+                                .and_then(|b| b.as_bool())
+                                .unwrap_or(false),
+                        }
+                    }
                     Some("hosts_backup") => EngineCommand::HostsBackup,
                     Some("hosts_prune_backups") => EngineCommand::HostsPruneBackups {
                         keep: v.get("keep").and_then(|k| k.as_u64()).unwrap_or(50) as usize,
@@ -1948,6 +2156,7 @@ mod tests {
             domain: domain.into(),
             reason: crate::hosts::PlanReason::Ipv6,
             previous_session: false,
+            replace_existing: false,
         };
         for (process, entry) in [
             ("Keep.exe", made("2606:4700::1", "keep.example.com")),
@@ -2067,6 +2276,7 @@ mod tests {
                 pid: 1234,
                 first_seen_ms: now,
                 last_seen_ms: now,
+                manual: false,
                 domains: vec![
                     crate::persist::SavedDomain {
                         domain: "old.example.com".into(),

@@ -411,14 +411,30 @@ netmon.exe --app "C:\Apppp.exe" --aaaa-workers 0      :: 关闭查询
 因为表是按进程分的。列：`process, domain, status, ipv6, attempts, elapsed_ms`。
 图形界面的域名表窗口里有「导出…」按钮，默认文件名是 `netmon-domains-<时间戳>.csv`。
 
+#### 手动编辑域名表
+
+「域名表 (Ctrl+W)」窗口不只是查看，也可以直接编辑：
+
+| 操作 | 说明 |
+|---|---|
+| **添加进程…** | 输入映像名（如 `msedge.exe`）新建一张空表；空表也会随缓存保存，重启后还在 |
+| **删除该进程…** | 删除左侧选中进程的**整张域名表**（确认框会写明域名数量）。hosts 里已经写入的条目**不受影响**，需要时到「写入 hosts」页移除 |
+| **添加域名…** | 向当前进程批量添加域名：一行一个，也支持逗号和空格分隔；大小写、重复项、空行会自动处理。新域名立即排入 AAAA 查询队列 |
+| **删除所选域名…** | 在右侧表格里 `Ctrl`/`Shift` 多选后批量删除；只改域名表，不动 hosts |
+
+改动会立刻反映到「写入 hosts」的预览里，并写入本地缓存（`domain-tables.json`），
+重启后仍然保留。手动添加的域名和真实抓到的域名没有区别，都会参与 AAAA 查询和
+hosts 写入计划。
+
 > 域名表本身只负责记录；把其中的域名写进 hosts 是下一节的独立动作。
 > `域名不存在 (NXDOMAIN)` 与「无 AAAA 记录」一样，按 `--no-aaaa` 策略处理：
 > 默认写成 `127.0.0.1`，选 `skip` 则不写入。
 
 ### 6.6 写入 hosts
 
-把**某一个进程**的域名表写进 hosts 文件。**一次只写一个进程**，而且要用户明确点
-「写入」才动——改 hosts 会影响整台机器的解析结果，不该自动发生。
+把所选进程（可以多个）的域名表写进 hosts 文件，而且要用户明确点「写入」才动——
+改 hosts 会影响整台机器的解析结果，不该自动发生。多进程会合并成一次文件改动、
+一次备份。
 
 写入和删除都是**按进程**的，而且两边都只由你发起（唯一例外是你自己打开的自动模式）：
 写入只影响所选进程，删除也只影响所选进程，两个进程之间互不干扰。
@@ -441,15 +457,21 @@ netmon.exe --app "C:\Apppp.exe" --aaaa-workers 0      :: 关闭查询
 | 没有这个域名 | **追加**一行 |
 | 已经写过，地址一样 | **不动** |
 | 已经写过，`127.0.0.1`，而现在有 IPv6 了 | **更新为 IPv6 地址**（唯一会被改写的方向） |
-| 已经写过，地址不同（比如别的 IPv6 地址） | **保持不变**——能用的地址不会被换掉 |
+| 已经写过，地址不同（比如别的 IPv6 地址） | **先核验再决定**：地址仍在最新 AAAA 回答里、或 TCP 443/80 能连上 → **保持不变**；两者都失败 → **替换**成本次解析到的最优 IPv6 地址 |
 | 别的进程写过的同一个域名 | 不重复写第二行，只把本进程**登记**到那一行上 |
 | 文件里本来就有（你自己的行） | **跳过**。你的行在前面，写第二行也轮不到它生效 |
 
-预览表里「hosts 里的现状」和「本次写入」两列就是这张表的逐行展开。**没东西可写时
-文件一个字节都不动**，也不会产生备份。
+预览表列出所选进程域名表里的**全部记录**：每行的查询状态、所有已记录的 AAAA
+地址、「将写入的地址」、「hosts 里的现状」和「本次写入」都会显示——不只是会发生
+变化的行。**没东西可写时文件一个字节都不动**，也不会产生备份。
 
 已经写入的行在不受影响时**逐字节保留**——包括你自己调过的空格。只有真要改的行
-（追加、更新地址、加登记）才会重写。
+（追加、更新地址、替换失效地址、加登记）才会重写。
+
+「核验」发生在每次写入前：先看这个地址是否还在该域名**当前**的 AAAA 回答里；
+不在时才做一次很短（约 0.6 秒）的 TCP 探测，端口 443、80 依次尝试。探测是并行
+的，最多 8 个地址同时进行。这样既不会把一个仍然可用的地址换掉，也不会让一个早已
+失效的地址一直留在 hosts 里。探测结果不显示在界面上，只体现在实际写入和日志里。
 
 #### 分进程：两个进程互不影响
 
@@ -570,8 +592,8 @@ CDN 场景下通常反映就近程度。**没有做延迟探测**，这是已知
 | 工具栏「写入 hosts (Ctrl+H)」 | 「写入」标签页：**右键多选进程（绿色）**、选策略、**自动模式开关（支持多进程）**、预览表格（含“进程”列）、写入（多进程合并为一次）、**写入所选域名（右键，可跨进程）**、**移除所选进程的条目**、移除全部条目…、备份、恢复备份…<br>「当前条目」标签页：hosts 文件里**现在**由本程序写入的条目，按进程分组；**Ctrl/Shift 多选，右键复制或删除所选行**<br>「查看 / 编辑」标签页：直接编辑并保存 |
 
 **没有「预览」按钮**：切换进程（可多选）、切换无 IPv6 策略、域名表变化（新域名、
-AAAA 结果落定、自动写入完成）都会让预览自己更新，约 1.2 秒内跟上。这个间隔是
-刻意加的——一个页面加载会产生几十次变化，每次都去问一遍引擎是浪费。
+AAAA 结果落定、手动编辑域名表、自动写入完成）都会让预览自己更新，约 1.2 秒内跟上。
+这个间隔是刻意加的——一个页面加载会产生几十次变化，每次都去问一遍引擎是浪费。
 刷新期间已选中的行会保留。
 
 **多选进程**：在进程列表上**右键**选择/取消选择、全选或全不选；已选择的进程
@@ -582,7 +604,7 @@ AAAA 结果落定、自动写入完成）都会让预览自己更新，约 1.2 �
 
 **只写选中的域名**：在预览表里 `Ctrl`/`Shift` 多选，右键选「写入所选域名」。
 选中的行可以来自不同进程，引擎合并成一次写入；写入范围缩小到这些域名，规则不变：
-有 IPv6 的写最优 IPv6，没有的仍按当前策略处理，已经被写过的保持原样。
+有 IPv6 的写最优 IPv6，没有的仍按当前策略处理，已经被写过且地址仍然可用的保持原样。
 自动模式不受预览选择影响，仍然写已选进程的整个域名表。
 
 **「当前条目」的多选与右键菜单**：
@@ -701,7 +723,7 @@ python gui\netmon_gui.py --app "D:\App\app.exe" --auto  :: 预填目标并自动
 | 导出… (F8) | 原生保存对话框，CSV 或 JSON |
 | 统计 (Ctrl+S) | 实时计数器 + 出现最多的域名 / 进程 |
 | 日志 (Ctrl+G) | 引擎诊断信息，含数据源状态与清理记录 |
-| 域名表 (Ctrl+W) | 每个进程的域名表：域名 / **当前解析地址** / AAAA 状态；可按**域名**或**解析地址**筛选；含重查失败项 / 全部重查 / 导出 |
+| 域名表 (Ctrl+W) | 每个进程的域名表：域名 / **当前解析地址** / AAAA 状态；可按**域名**或**解析地址**筛选；含重查失败项 / 全部重查 / 导出；**可直接编辑：添加进程 / 批量添加域名 / 多选删除域名 / 删除整个进程的域名表** |
 | 写入 hosts (Ctrl+H) | 「写入」标签页：**右键选择进程（绿色）**、自动更新的预览（现状 + 本次写入两列）、写入（多进程合并为一次）、**Ctrl 多选后右键只写所选域名**、**移除所选进程的条目**、移除全部条目…、备份、恢复；「当前条目」标签页：文件里现在由本程序写入的条目，按进程分组，**Ctrl/Shift 多选后可批量复制/删除**；「查看 / 编辑」标签页：直接编辑并保存 |
 | 过滤 | 域名/进程/地址实时过滤（输入即生效）+ 数据源勾选。地址框支持 IP、网段 `10.0.0.0/8` 或片段 |
 | 只看这些进程 | 从已出现过的进程里勾选（`Ctrl+T` 或点「选择进程…」），只显示这些进程的记录 |
@@ -803,14 +825,15 @@ seq  time  process  pid  qtype  source  kind  domain  detail
 | `status` | 每 `--status-interval-ms` | `uptime_s`、`records`、`queries`、`sni`、`domains`、`processes`、`tree_members`、`filtered_out_of_tree`、`rate`、`cpu_percent`、`drops_kernel`、`drops_queue`、`running`、`etw`、`npcap`、`aaaa_*` |
 | `domain` | 域名表新增一个域名 | `process`、`domain` |
 | `aaaa` | AAAA 状态或解析地址变化 | `domain`、`status`、`addresses`、`resolved_ips`、`settled`、`resolved_by_us`、`archived` |
-| `domain_tables` | 启动时（上次会话的缓存）与结束时 | `tables[]`（`process`、`domains[]`） |
-| `hosts_preview` | 回答 `hosts_preview` | `process`、`policy`、`entries[]`（`domain`、`address`、`written`、`action`、`reason`、`previous`、`needs_write`） |
+| `domain_tables` | 启动时（上次会话的缓存）、域名表编辑后、结束时 | `tables[]`（`process`、`domains[]`；编辑后为完整快照） |
+| `hosts_preview` | 回答 `hosts_preview` | `process`、`policy`、`entries[]`（`domain`、`address`、`written`、`action`、`reason`、`previous`、`needs_write`、`table_status`、`recorded[]`、`settled`、`archived`） |
 | `hosts_content` | 回答 `hosts_read` | `path`、`text`、`managed_entries`、`total_entries`、`by_owner[]`、`entries[]`（`address`、`domain`、`owners[]`、`line`）、`backup_dir`、`backups[]`、`data_dir` |
 | `hosts_history` | 回答 `hosts_history` | `entries[]`（改动日志，跨重启） |
 | `hosts_auto` | 自动模式开关结果 | `enabled`、`processes[]`、`process`（第一个，兼容旧版）、`note` |
 | `hosts_auto_written` | 自动模式写入一次 | `note`、`appended`、`upgraded`、`claimed`、`kept`、`skipped`、`processes[]`、`process`、`writes` |
 | `hosts_written` / `hosts_removed` / `hosts_edited` / `hosts_restored` | 对应的写操作完成 | `ok`、`note`、`path`、`backup`、`appended`、`upgraded`、`claimed`、`kept`、`skipped`、`removed`、`shared`、`unchanged`、`managed_entries` |
 | `hosts_result` | 操作失败或无改动的提示 | `ok`、`note` |
+| `domains_edited` | 域名表编辑完成 | `ok`、`process`、`added`、`removed`、`removed_process`、`saved`、`note` |
 | `summary` | 会话结束 | 行数、查询数、域名数、丢包数、各数据源计数 |
 | `fatal` | 启动失败，即将退出 | `text` |
 
@@ -827,6 +850,7 @@ seq  time  process  pid  qtype  source  kind  domain  detail
 | `hosts_remove_entry` | `domain`、`address`、`process` | 删除文件里这一行（即使被多个进程共用）；`process` 只用于记录 |
 | `hosts_read` | — | 读整个文件与当前条目 |
 | `hosts_history` | `limit` | 读改动日志 |
+| `domains_edit` | `process`、`add[]`、`remove[]`、`remove_process` | 编辑域名表：添加/删除域名，或删除整个进程的域名表 |
 | `hosts_edit` | `text` | 整体替换文件 |
 | `hosts_auto` | `on`、`processes[]`、`policy` | 开关自动模式；多个进程时合并写入 |
 | `hosts_backup` / `hosts_restore` / `hosts_prune_backups` | `path` / `keep` | 备份、恢复、清理 |

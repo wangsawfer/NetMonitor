@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_TITLE = "NetMonitor — 目标应用 DNS 监控"
 MAX_ROWS = 20000          # 表格中保留的最大行数，避免长时间运行后变慢
@@ -63,6 +63,7 @@ KIND_LABELS = {
 ACTION_TAGS = {
     "追加": "add",
     "更新为 IPv6": "update",
+    "替换失效地址": "update",
     "登记本进程": "claim",
     "不动": "keep",
     "跳过": "skip",
@@ -140,6 +141,27 @@ def relaunch_as_admin() -> bool:
         return int(rc) > 32
     except Exception:
         return False
+
+
+def parse_domain_names(text: str) -> list[str]:
+    """把多行 / 逗号 / 空白分隔的域名拆成去重后的列表。
+
+    与引擎的校验保持一致：去空白、转小写、丢掉空项和含 ``#`` 的项；
+    用户从网页或表格粘贴时，一行一个、用逗号分隔都能接受。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    cooked = (text.replace("，", ",").replace("；", ";")
+              .replace(";", " ").replace(",", " "))
+    for raw in cooked.split():
+        name = raw.strip().strip('"').strip("'").lower().rstrip(".")
+        if not name or "#" in name:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 def split_args(text: str) -> list[str]:
@@ -414,6 +436,8 @@ class App(ttk.Frame):
         self._hosts_last_refresh = 0.0
         self._domains_win: Optional[tk.Toplevel] = None
         self._domains_tree: Optional[ttk.Treeview] = None
+        # The process to focus after the next domain_tables event (an edit).
+        self._domains_pending: Optional[str] = None
         self._domains_proc: Optional[tk.Listbox] = None
         # Domain-table filters. Both are applied as case-insensitive substrings,
         # the same contract the main list's filter box has.
@@ -824,12 +848,26 @@ class App(ttk.Frame):
                     f"批量删除中断：{ev.get('note', '')}", ok=False)
             else:
                 self._set_hosts_status(ev.get("note", ""), ok=ev.get("ok", True))
+        elif kind == "domains_edited":
+            note = ev.get("note", "")
+            if note:
+                self._log(note)
+            self._domains_pending = ev.get("process") or None
         elif kind == "domain_tables":
-            # Sent at startup (the previous session's tables) and again at the
-            # end of a run, so a UI opened later still fills in.
-            for t in ev.get("tables", []):
+            # Sent at startup (the previous session's tables), after every edit,
+            # and again at the end of a run. It is a complete snapshot, so it
+            # replaces the local view: a deleted domain or process must disappear
+            # here too, which a merge could never do.
+            tables = ev.get("tables", [])
+            domains: dict[str, set[str]] = {}
+            aaaa: dict[str, dict] = {}
+            for t in tables:
+                process = t.get("process", "")
+                bag = domains.setdefault(process, set())
                 for row in t.get("domains", []):
-                    self.aaaa[row.get("domain", "")] = {
+                    domain = row.get("domain", "")
+                    bag.add(domain)
+                    aaaa[domain] = {
                         "status": row.get("status", ""),
                         "addresses": row.get("addresses", []),
                         "resolved_ips": row.get("resolved_ips", []),
@@ -837,8 +875,18 @@ class App(ttk.Frame):
                         "resolved_by_us": bool(row.get("resolved_by_us", False)),
                         "archived": bool(row.get("archived", False)),
                     }
-                    self.domains.setdefault(t.get("process", ""), set()).add(
-                        row.get("domain", ""))
+            self.domains = domains
+            self.aaaa = aaaa
+            if self._domains_win is not None and self._domains_win.winfo_exists():
+                self._refresh_domains_window()
+            if (self._hosts_win is not None and self._hosts_win.winfo_exists()
+                    and self.engine is not None and self.engine.running):
+                # Same rule as any other table change: one event, one refresh.
+                # The final snapshot arrives as the engine stops; asking a dead
+                # engine for a preview would only raise a confusing hint.
+                self._hosts_dirty = True
+                self._fill_hosts_processes()
+                self._refresh_hosts_preview()
         elif kind == "summary":
             self._log(
                 "会话结束：{queries} 次 DNS 查询，{domains} 个域名，"
@@ -1571,6 +1619,19 @@ class App(ttk.Frame):
         ttk.Button(top, text="重查失败项", command=lambda: self.send_requery(True),
                    width=12).pack(side="right", padx=(6, 0))
 
+        editbar = ttk.Frame(win, padding=(8, 6, 8, 0))
+        editbar.pack(fill="x")
+        ttk.Button(editbar, text="添加进程…", command=self.on_add_domain_process,
+                   width=12).pack(side="left")
+        ttk.Button(editbar, text="删除该进程…", command=self.on_remove_domain_process,
+                   width=13).pack(side="left", padx=6)
+        ttk.Button(editbar, text="添加域名…", command=self.on_add_domains,
+                   width=11).pack(side="left", padx=(16, 0))
+        ttk.Button(editbar, text="删除所选域名…", command=self.on_remove_domains,
+                   width=15).pack(side="left", padx=6)
+        ttk.Label(editbar, text="Ctrl/Shift 多选；删除进程只删域名表",
+                  foreground="#666666").pack(side="right")
+
         body = ttk.Frame(win, padding=8)
         body.pack(fill="both", expand=True)
         body.rowconfigure(0, weight=1)
@@ -1678,7 +1739,8 @@ class App(ttk.Frame):
                   f"有 AAAA {s.aaaa_found}   无 AAAA {s.aaaa_none}   "
                   f"查询失败 {s.aaaa_failed}"))
 
-        keep = self._selected_process()
+        keep = self._domains_pending or self._selected_process()
+        self._domains_pending = None
         ordered = sorted(self.domains.items(), key=lambda kv: (-len(kv[1]), kv[0]))
 
         lb.delete(0, "end")
@@ -1756,6 +1818,147 @@ class App(ttk.Frame):
             else:
                 self._domains_count.configure(text=f"共 {len(rows)}")
 
+    def _selected_domains(self) -> list[str]:
+        """Domains selected in the right-hand table, in display order."""
+        tree = self._domains_tree
+        if tree is None or not tree.winfo_exists():
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for iid in tree.selection():
+            values = tree.item(iid, "values")
+            if not values:
+                continue
+            name = str(values[0])
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
+
+    def _ask_domains_text(self, title: str, prompt: str) -> Optional[str]:
+        """A small multiline prompt: one domain per line (or comma separated)."""
+        parent = self._domains_win or self.master
+        win = tk.Toplevel(parent)
+        win.title(f"NetMonitor — {title}")
+        win.transient(parent)
+        win.geometry("580x320")
+        win.minsize(420, 240)
+        win.grab_set()
+        ttk.Label(win, text=prompt, justify="left", wraplength=540).pack(
+            anchor="w", padx=10, pady=(10, 4))
+        result: dict[str, Optional[str]] = {"value": None}
+
+        def ok() -> None:
+            result["value"] = text.get("1.0", "end")
+            win.destroy()
+
+        buttons = ttk.Frame(win)
+        buttons.pack(side="bottom", fill="x", padx=10, pady=(4, 10))
+        ttk.Button(buttons, text="确定", command=ok, width=10).pack(side="right")
+        ttk.Button(buttons, text="取消", command=win.destroy,
+                   width=10).pack(side="right", padx=6)
+        body = ttk.Frame(win)
+        body.pack(side="top", fill="both", expand=True, padx=10, pady=4)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        text = tk.Text(body, width=62, height=9, wrap="none",
+                       font=("Consolas", 10), undo=True)
+        sb = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=sb.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        win.bind("<Escape>", lambda _e: win.destroy())
+        text.focus_set()
+        win.wait_window()
+        return result["value"]
+
+    def _send_domains_edit(self, process: str, add: Optional[list[str]] = None,
+                           remove: Optional[list[str]] = None,
+                           remove_process: bool = False) -> bool:
+        sent = self.send_command({
+            "cmd": "domains_edit",
+            "process": process,
+            "add": add or [],
+            "remove": remove or [],
+            "remove_process": remove_process,
+        })
+        if sent:
+            self._domains_pending = process
+            if self._domains_count is not None and self._domains_count.winfo_exists():
+                self._domains_count.configure(text="正在更新域名表…")
+        return sent
+
+    def on_add_domain_process(self) -> None:
+        name = simpledialog.askstring(
+            "添加进程", "进程映像名（例如 msedge.exe）：", parent=self._domains_win)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if any(n.lower() == name.lower() for n in self.domains):
+            messagebox.showinfo(APP_TITLE, f"域名表里已有 {name}。")
+            return
+        if self._send_domains_edit(name):
+            self._log(f"已添加进程 {name}（空表，接着可添加域名）")
+
+    def on_remove_domain_process(self) -> None:
+        name = self._selected_process()
+        if name is None:
+            messagebox.showinfo(APP_TITLE, "先在左侧选择一个进程。")
+            return
+        count = len(self.domains.get(name, ()))
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"删除进程 {name} 及其域名表里的 {count} 个域名？\n\n"
+            "只删除域名表；hosts 文件里已经写入的条目不受影响，"
+            "需要时请在「写入 hosts」页移除。",
+        ):
+            return
+        if self._send_domains_edit(name, remove_process=True):
+            self._log(f"已删除进程 {name} 的域名表（{count} 个域名）")
+
+    def on_add_domains(self) -> None:
+        name = self._selected_process()
+        if name is None:
+            messagebox.showinfo(APP_TITLE, "先在左侧选择一个进程，再添加域名。")
+            return
+        text = self._ask_domains_text(
+            "添加域名",
+            f"添加到 {name} 的域名表。每行一个，也可以用逗号或空格分隔；"
+            "重复的域名会自动忽略。",
+        )
+        if text is None:
+            return
+        names = parse_domain_names(text)
+        if not names:
+            messagebox.showinfo(APP_TITLE, "没有解析出可添加的域名。")
+            return
+        if self._send_domains_edit(name, add=names):
+            self._log(f"向 {name} 添加 {len(names)} 个域名")
+
+    def on_remove_domains(self) -> None:
+        name = self._selected_process()
+        if name is None:
+            messagebox.showinfo(APP_TITLE, "先在左侧选择一个进程。")
+            return
+        names = self._selected_domains()
+        if not names:
+            messagebox.showinfo(APP_TITLE, "先在右侧选中域名（Ctrl/Shift 可多选）。")
+            return
+        listing = "\n".join(names[:12])
+        if len(names) > 12:
+            listing += f"\n… 共 {len(names)} 个"
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"从 {name} 的域名表删除选中的 {len(names)} 个域名？\n\n"
+            f"{listing}\n\n"
+            "只改域名表；hosts 文件里已经写入的条目不受影响。",
+        ):
+            return
+        if self._send_domains_edit(name, remove=names):
+            self._log(f"从 {name} 删除 {len(names)} 个域名")
+
     def _clear_domain_filters(self) -> None:
         self._domain_filter.set("")
         self._addr_filter.set("")
@@ -1778,7 +1981,7 @@ class App(ttk.Frame):
 
         win = tk.Toplevel(self.master)
         win.title("NetMonitor — 写入 hosts")
-        win.geometry("1000x640")
+        win.geometry("1080x680")
         win.transient(self.master)
         self._hosts_win = win
         win.protocol("WM_DELETE_WINDOW", self.on_close_hosts)
@@ -1871,25 +2074,31 @@ class App(ttk.Frame):
         table_area = ttk.Frame(tab1)
         table_area.pack(side="top", fill="both", expand=True)
 
-        cols = ("process", "domain", "address", "written", "action", "reason")
+        cols = ("process", "domain", "recorded", "address", "written", "action", "reason")
         tree = ttk.Treeview(table_area, columns=cols, show="headings",
                             selectmode="extended")
         tree.heading("process", text="进程")
         tree.heading("domain", text="域名")
+        tree.heading("recorded", text="域名表记录（AAAA）")
         tree.heading("address", text="将写入的地址")
         tree.heading("written", text="hosts 里的现状")
         tree.heading("action", text="本次写入")
         tree.heading("reason", text="说明")
-        tree.column("process", width=150, anchor="w")
-        tree.column("domain", width=210, anchor="w")
-        tree.column("address", width=210, anchor="w")
-        tree.column("written", width=140, anchor="w")
-        tree.column("action", width=95, anchor="w")
-        tree.column("reason", width=130, anchor="w")
+        tree.column("process", width=95, anchor="w")
+        tree.column("domain", width=145, anchor="w")
+        tree.column("recorded", width=215, anchor="w")
+        tree.column("address", width=165, anchor="w")
+        tree.column("written", width=100, anchor="w")
+        tree.column("action", width=75, anchor="w")
+        tree.column("reason", width=135, anchor="w")
+        table_area.rowconfigure(0, weight=1)
+        table_area.columnconfigure(0, weight=1)
         sb = ttk.Scrollbar(table_area, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=sb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        sbx = ttk.Scrollbar(table_area, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=sb.set, xscrollcommand=sbx.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        sbx.grid(row=1, column=0, columnspan=2, sticky="ew")
         tree.tag_configure("add", foreground="#0a7d3d")
         tree.tag_configure("update", foreground="#8a6d1f")
         tree.tag_configure("claim", foreground="#3d5a80")
@@ -2198,10 +2407,17 @@ class App(ttk.Frame):
                 reason = f"{reason}（上次会话）"
             domain = e.get("domain", "")
             process = e.get("process", "")
+            recorded = "，".join(e.get("recorded") or [])
+            table_status = e.get("table_status") or ""
+            if e.get("archived"):
+                table_status += "（上次会话）"
+            recorded_text = (f"{table_status}：{recorded}" if recorded
+                             else table_status)
             iid = f"row{index}"
             tree.insert("", "end", iid=iid, values=(
                 process,
                 domain,
+                recorded_text,
                 e.get("address", "") or "（不写入）",
                 e.get("written", ""),
                 action,
@@ -2222,7 +2438,8 @@ class App(ttk.Frame):
         self._set_hosts_status(
             f"（{who}）{len(self.hosts_preview)} 条："
             + "、".join(parts)
-            + " ｜ 写入只增不改：已写入的域名不动，也不会重复写入", ok=True)
+            + " ｜ 列出所选进程域名表的全部记录；写入只增不改，"
+              "只有已写入的地址核验不可用、或原为 127.0.0.1 时才替换", ok=True)
 
     def _render_hosts_content(self) -> None:
         edit = getattr(self, "_hosts_edit", None)

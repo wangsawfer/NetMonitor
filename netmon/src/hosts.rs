@@ -89,6 +89,10 @@ pub struct PlannedEntry {
     /// a lookup made now. Shown next to the row, never hidden: re-writing such
     /// a row writes an answer that may be days old.
     pub previous_session: bool,
+    /// The address already in the block for this domain was probed and did not
+    /// answer, so this row may replace it even though an address is present.
+    /// Only a write sets this; a preview without probing leaves it false.
+    pub replace_existing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -179,6 +183,7 @@ where
                 domain: domain.to_string(),
                 reason: PlanReason::Ipv6,
                 previous_session: false,
+                replace_existing: false,
             }),
             None => match policy {
                 NoAaaaPolicy::Skip => out.push(PlannedEntry {
@@ -186,12 +191,14 @@ where
                     domain: domain.to_string(),
                     reason: PlanReason::SkippedNoIpv6,
                     previous_session: false,
+                    replace_existing: false,
                 }),
                 NoAaaaPolicy::Block => out.push(PlannedEntry {
                     address: BLOCK_ADDRESS.to_string(),
                     domain: domain.to_string(),
                     reason: PlanReason::BlockedNoIpv6,
                     previous_session: false,
+                    replace_existing: false,
                 }),
             },
         }
@@ -218,9 +225,12 @@ pub enum WrittenState {
     /// In our block pointing at the loopback block address, while a usable IPv6
     /// address is now available.
     Upgrade,
-    /// In our block, pointing somewhere else. Left alone: an address that
-    /// already works is never replaced by a less useful one.
+    /// In our block, pointing somewhere else. Left alone unless a probe found
+    /// that the address no longer answers.
     OtherAddress,
+    /// In our block with a different address, and that address failed the
+    /// usability probe made just before this write.
+    StaleAddress,
     /// In the file, but outside our block -- the user put it there.
     OutsideOurBlock,
 }
@@ -235,6 +245,7 @@ impl WrittenState {
             WrittenState::Unrecorded => "已写入(未记录进程)",
             WrittenState::Upgrade => "已写入(127.0.0.1)",
             WrittenState::OtherAddress => "已写入(地址不同)",
+            WrittenState::StaleAddress => "已写入(地址失效)",
             WrittenState::OutsideOurBlock => "文件里已有(非本程序)",
         }
     }
@@ -250,6 +261,8 @@ pub enum RowAction {
     Append,
     /// Put the IPv6 address we now have in place of the loopback block address.
     Update,
+    /// Replace an address that failed the usability probe with the fresh one.
+    Replace,
     /// Leave the address alone and record this process on the line, so removing
     /// this process's entries later knows the line is shared with another one.
     Claim,
@@ -265,6 +278,7 @@ impl RowAction {
         match self {
             RowAction::Append => "追加",
             RowAction::Update => "更新为 IPv6",
+            RowAction::Replace => "替换失效地址",
             RowAction::Claim => "登记本进程",
             RowAction::Keep => "不动",
             RowAction::Skip => "跳过",
@@ -273,7 +287,10 @@ impl RowAction {
 
     /// Does this row leave the file different from what is on disk?
     pub fn changes_file(self) -> bool {
-        matches!(self, RowAction::Append | RowAction::Update | RowAction::Claim)
+        matches!(
+            self,
+            RowAction::Append | RowAction::Update | RowAction::Replace | RowAction::Claim
+        )
     }
 }
 
@@ -361,6 +378,8 @@ pub struct Merge {
     pub bytes: Vec<u8>,
     pub appended: usize,
     pub upgraded: usize,
+    /// Lines whose previous address failed the usability probe.
+    pub replaced: usize,
     pub claimed: usize,
     /// Rows already exactly right, left untouched.
     pub kept: usize,
@@ -657,6 +676,12 @@ pub fn classify(
                 if b.address == BLOCK_ADDRESS && e.address != BLOCK_ADDRESS {
                     return RowPlan::new(WrittenState::Upgrade, RowAction::Update);
                 }
+                if e.replace_existing
+                    && !e.address.is_empty()
+                    && !e.address.eq_ignore_ascii_case(BLOCK_ADDRESS)
+                {
+                    return RowPlan::new(WrittenState::StaleAddress, RowAction::Replace);
+                }
                 return RowPlan::new(WrittenState::OtherAddress, RowAction::Keep);
             }
             if all.iter().any(|(_, n)| n.eq_ignore_ascii_case(&e.domain)) {
@@ -705,7 +730,16 @@ pub fn merge(file: &HostsFile, process: &str, plan: &[PlannedEntry]) -> Merge {
                 if let Some(e) = at.map(|i| &mut entries[i]) {
                     e.address = p.address.clone();
                     e.raw = None;
+                    e.claim(process);
                     out.upgraded += 1;
+                }
+            }
+            RowAction::Replace => {
+                if let Some(e) = at.map(|i| &mut entries[i]) {
+                    e.address = p.address.clone();
+                    e.raw = None;
+                    e.claim(process);
+                    out.replaced += 1;
                 }
             }
             RowAction::Claim => {
@@ -718,7 +752,7 @@ pub fn merge(file: &HostsFile, process: &str, plan: &[PlannedEntry]) -> Merge {
             RowAction::Skip => out.skipped += 1,
         }
     }
-    out.changed = out.appended + out.upgraded + out.claimed > 0;
+    out.changed = out.appended + out.upgraded + out.replaced + out.claimed > 0;
     if out.changed {
         out.bytes = file.render_block(&entries);
     }
@@ -733,9 +767,9 @@ pub fn merge(file: &HostsFile, process: &str, plan: &[PlannedEntry]) -> Merge {
 /// same lines but two rewrites of the file -- and, in automatic mode, two
 /// debounce cycles for one page load.
 ///
-/// An address already in the block is never replaced by a different working
-/// address, exactly as in [`merge`]: the only correction is the block address
-/// becoming a real IPv6 one.
+/// An address already in the block is never replaced by a different *working*
+/// address, exactly as in [`merge`]. The two corrections are the block address
+/// becoming a real IPv6 one, and an address the caller's probe marked dead.
 pub fn merge_owned(file: &HostsFile, rows: &[(Vec<String>, PlannedEntry)]) -> Merge {
     let mut entries = file.block_entries();
     let all = file.all_entries();
@@ -787,10 +821,21 @@ pub fn merge_owned(file: &HostsFile, rows: &[(Vec<String>, PlannedEntry)]) -> Me
                         e.claim(owner);
                     }
                     out.upgraded += 1;
+                } else if p.replace_existing
+                    && !p.address.is_empty()
+                    && !p.address.eq_ignore_ascii_case(BLOCK_ADDRESS)
+                {
+                    e.address = p.address.clone();
+                    e.raw = None;
+                    for owner in owners {
+                        e.claim(owner);
+                    }
+                    out.replaced += 1;
                 } else {
                     // A working address already in the block is never replaced
-                    // by a different one. Both processes still rely on the
-                    // name, so both are recorded as owners.
+                    // by a different one unless the caller probed it and found
+                    // it dead. Both processes still rely on the name, so both
+                    // are recorded as owners.
                     let mut claimed = false;
                     for owner in owners {
                         if !e.is_owned_by(owner) {
@@ -807,7 +852,7 @@ pub fn merge_owned(file: &HostsFile, rows: &[(Vec<String>, PlannedEntry)]) -> Me
             }
         }
     }
-    out.changed = out.appended + out.upgraded + out.claimed > 0;
+    out.changed = out.appended + out.upgraded + out.replaced + out.claimed > 0;
     if out.changed {
         out.bytes = file.render_block(&entries);
     }
@@ -1197,6 +1242,7 @@ mod tests {
             domain: domain.into(),
             reason: PlanReason::Ipv6,
             previous_session: false,
+            replace_existing: false,
         }
     }
 
@@ -1624,6 +1670,36 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_address_is_replaced_when_the_probe_marks_it() {
+        let p = write_temp("stale.hosts", SAMPLE);
+        let f = HostsFile::load(&p).unwrap();
+        let first = merged(&p, &f, "edge.exe", &one("stale.example.com", "2606:4700::1"));
+        assert_eq!(first.managed_entries()[0].0, "2606:4700::1");
+
+        // The probe failed for the old address; the fresh answer may replace it.
+        let mut fresh = entry("2606:4700::2", "stale.example.com");
+        fresh.replace_existing = true;
+        let m = merge(&first, "edge.exe", std::slice::from_ref(&fresh));
+        assert!(m.changed);
+        assert_eq!(m.replaced, 1);
+        assert_eq!(m.kept, 0);
+        let after = reload(&p, m.bytes);
+        assert_eq!(after.managed_entries()[0].0, "2606:4700::2");
+        assert_eq!(after.block_entries()[0].owners, names(&["edge.exe"]));
+    }
+
+    #[test]
+    fn classify_marks_a_stale_address_as_replaceable() {
+        let mut fresh = entry("2606:4700::2", "stale.example.com");
+        fresh.replace_existing = true;
+        let managed = vec![be("2606:4700::1", "stale.example.com", &["edge.exe"])];
+        let got = classify(std::slice::from_ref(&fresh), &managed, &[], "edge.exe");
+        assert_eq!(got[0].state, WrittenState::StaleAddress);
+        assert_eq!(got[0].action, RowAction::Replace);
+        assert!(got[0].action.changes_file());
+    }
+
+    #[test]
     fn a_line_an_older_version_wrote_is_claimed_instead_of_duplicated() {
         let rows = vec![entry("2606:4700::8", "legacy.example.com")];
         let managed = vec![be("2606:4700::8", "legacy.example.com", &[])];
@@ -1648,6 +1724,7 @@ mod tests {
             domain: "x.test".into(),
             reason: PlanReason::SkippedNoIpv6,
             previous_session: false,
+            replace_existing: false,
         }];
         let got = classify(&rows, &[], &[], "edge.exe");
         assert_eq!(got[0].state, WrittenState::Absent);

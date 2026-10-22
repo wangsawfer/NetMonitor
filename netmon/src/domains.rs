@@ -57,6 +57,9 @@ pub struct ProcessDomains {
     pub last_seen_ms: i64,
     /// How many query records this process contributed in total.
     pub records: u64,
+    /// A table the user created by hand. Kept even when it has no domains yet,
+    /// so an empty process survives a restart.
+    pub manual: bool,
 }
 
 /// Where a domain's AAAA lookup stands.
@@ -268,6 +271,7 @@ impl DomainIntel {
                         first_seen_ms: now,
                         last_seen_ms: now,
                         records: 0,
+                        manual: false,
                     },
                 );
             }
@@ -387,6 +391,7 @@ impl DomainIntel {
                     pid: p.pid,
                     first_seen_ms: p.first_seen_ms,
                     last_seen_ms: p.last_seen_ms,
+                    manual: p.manual,
                     domains: p
                         .domains
                         .iter()
@@ -432,6 +437,7 @@ impl DomainIntel {
                         first_seen_ms: p.first_seen_ms,
                         last_seen_ms: p.last_seen_ms,
                         records: 0,
+                        manual: p.manual,
                     },
                 );
             }
@@ -483,6 +489,157 @@ impl DomainIntel {
                 (d.clone(), e)
             })
             .collect()
+    }
+
+    /// Create an empty table for a process the user typed in.
+    ///
+    /// Returns false when a table with that name already exists. The table is
+    /// marked manual so an empty one survives a restart; adding a domain to it
+    /// works exactly like a table captured from traffic.
+    pub fn add_process(&self, process: &str) -> bool {
+        let process = process.trim();
+        if process.is_empty() {
+            return false;
+        }
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if inner
+            .processes
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(process))
+        {
+            return false;
+        }
+        let now = now_unix_ms();
+        inner.order.push(process.to_string());
+        inner.processes.insert(
+            process.to_string(),
+            ProcessDomains {
+                name: process.to_string(),
+                pid: 0,
+                domains: BTreeSet::new(),
+                first_seen_ms: now,
+                last_seen_ms: now,
+                records: 0,
+                manual: true,
+            },
+        );
+        true
+    }
+
+    /// Add names to one process's table, creating the table when needed.
+    ///
+    /// Returns how many names were new. A name that is already there is left
+    /// alone (and not re-resolved); a new name is queued for an AAAA lookup so
+    /// the hosts preview can use it as soon as the answer arrives.
+    pub fn add_domains(&self, process: &str, domains: &[String]) -> usize {
+        let process = process.trim();
+        if process.is_empty() {
+            return 0;
+        }
+        let mut new_names: Vec<String> = Vec::new();
+        let mut scheduled_names: Vec<String> = Vec::new();
+        {
+            let Ok(mut inner) = self.inner.lock() else {
+                return 0;
+            };
+            if !inner.processes.contains_key(process) {
+                let now = now_unix_ms();
+                inner.order.push(process.to_string());
+                inner.processes.insert(
+                    process.to_string(),
+                    ProcessDomains {
+                        name: process.to_string(),
+                        pid: 0,
+                        domains: BTreeSet::new(),
+                        first_seen_ms: now,
+                        last_seen_ms: now,
+                        records: 0,
+                        manual: true,
+                    },
+                );
+            }
+            let Some(table) = inner.processes.get_mut(process) else {
+                return 0;
+            };
+            table.last_seen_ms = now_unix_ms();
+            for raw in domains {
+                let d = raw.trim().to_ascii_lowercase();
+                if d.is_empty() || d.contains(char::is_whitespace) || d.contains('#') {
+                    continue;
+                }
+                if table.domains.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+                    continue;
+                }
+                table.domains.insert(d.clone());
+                new_names.push(d);
+            }
+            for d in &new_names {
+                if !inner.results.contains_key(d) {
+                    inner.results.insert(d.clone(), AaaaEntry::pending(d));
+                    scheduled_names.push(d.clone());
+                }
+            }
+            if !scheduled_names.is_empty() {
+                self.counters
+                    .unique_domains
+                    .fetch_add(scheduled_names.len() as u64, Ordering::Relaxed);
+            }
+        }
+        for d in scheduled_names {
+            self.enqueue(d);
+        }
+        new_names.len()
+    }
+
+    /// Remove names from one process's table. Returns how many disappeared.
+    ///
+    /// The process itself stays, even when its table becomes empty: deleting a
+    /// whole process is a separate, explicit action.
+    pub fn remove_domains(&self, process: &str, domains: &[String]) -> usize {
+        let Ok(mut inner) = self.inner.lock() else {
+            return 0;
+        };
+        let Some(table) = inner.processes.get_mut(process) else {
+            return 0;
+        };
+        let mut removed = 0usize;
+        for raw in domains {
+            let d = raw.trim();
+            if d.is_empty() {
+                continue;
+            }
+            if let Some(key) = table
+                .domains
+                .iter()
+                .find(|x| x.eq_ignore_ascii_case(d))
+                .cloned()
+            {
+                table.domains.remove(&key);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            prune_orphan_results(&mut inner);
+        }
+        removed
+    }
+
+    /// Delete a process table and every domain in it.
+    ///
+    /// Existing hosts lines are not touched: they are managed on the hosts page,
+    /// where removing a process's entries is a separate decision.
+    pub fn remove_process(&self, process: &str) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if inner.processes.remove(process).is_none() {
+            return false;
+        }
+        inner.order.retain(|n| n != process);
+        prune_orphan_results(&mut inner);
+        true
     }
 
     /// Flattened view over every process, for export and for the "all" listing.
@@ -660,6 +817,16 @@ fn saved_domain(domain: &str, entry: Option<&AaaaEntry>) -> crate::persist::Save
     s
 }
 
+/// Drop lookup results no table references any more.
+fn prune_orphan_results(inner: &mut Inner) {
+    let used: std::collections::HashSet<&String> = inner
+        .processes
+        .values()
+        .flat_map(|p| p.domains.iter())
+        .collect();
+    inner.results.retain(|d, _| used.contains(d));
+}
+
 /// Rebuild an entry from the snapshot. Always archived: nothing here was
 /// observed in the running session.
 fn saved_entry(d: &crate::persist::SavedDomain) -> AaaaEntry {
@@ -807,6 +974,30 @@ mod tests {
         );
         // The lookups that did not fit are dropped and counted, not waited on.
         assert!(d.stats().queue_dropped > 0);
+    }
+
+    #[test]
+    fn user_edits_create_and_remove_tables() {
+        let d = offline();
+        assert!(d.add_process("manual.exe"));
+        assert!(!d.add_process("MANUAL.EXE"), "names are case-insensitive here");
+        assert!(d.add_domains(
+            "manual.exe",
+            &["Added.Example".into(), "added.example".into(), "bad name".into()]
+        ) == 1);
+        let rows = d.rows_for("manual.exe");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "added.example");
+
+        // A second process can be created by adding a name directly.
+        assert_eq!(d.add_domains("other.exe", &["x.test".into()]), 1);
+        assert_eq!(d.process_tables().len(), 2);
+
+        assert_eq!(d.remove_domains("manual.exe", &["ADDED.EXAMPLE".into()]), 1);
+        assert!(d.rows_for("manual.exe").is_empty());
+        assert!(!d.remove_process("missing.exe"));
+        assert!(d.remove_process("other.exe"));
+        assert_eq!(d.process_tables().len(), 1);
     }
 
     #[test]
