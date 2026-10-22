@@ -2086,7 +2086,7 @@ class App(ttk.Frame):
         tree.heading("reason", text="说明")
         tree.column("process", width=95, anchor="w")
         tree.column("domain", width=145, anchor="w")
-        tree.column("recorded", width=215, anchor="w")
+        tree.column("recorded", width=315, anchor="w")
         tree.column("address", width=165, anchor="w")
         tree.column("written", width=100, anchor="w")
         tree.column("action", width=75, anchor="w")
